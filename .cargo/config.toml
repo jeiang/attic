@@ -1,3 +1,17 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
 rustdocflags = ["--cfg", "tokio_unstable"]
+
+[env]
+# Baked-in jemalloc runtime defaults for `tikv-jemalloc-sys` (used by the
+# `attic-server` binaries as the global allocator, see server/src/alloc.rs).
+#
+# This is read directly by `tikv-jemalloc-sys`'s build script and passed to
+# jemalloc's `./configure --with-malloc-conf=...`, so it applies regardless of
+# jemalloc's symbol-prefixing scheme (which otherwise makes a plain
+# `malloc_conf` weak-symbol override unreliable across platforms/crate
+# versions). `background_thread:true` purges dirty pages off the allocating
+# thread's hot path; the two `*_decay_ms` settings return freed memory to the
+# OS after 10s idle instead of holding it in per-thread arenas indefinitely,
+# which is what lets RSS come back down after a burst in a memory-capped pod.
+JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000"
