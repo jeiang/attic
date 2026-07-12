@@ -13,6 +13,7 @@ attic = { path = "../attic" }
 
 anyhow = "1.0.98"
 async-channel = "2.5.0"
+base64 = "0.22.1"
 bytes = "1.10.1"
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5.54"
@@ -25,10 +26,13 @@ humantime = "2.2.0"
 indicatif = "0.18.0"
 lazy_static = "1.5.0"
 notify = { version = "8.1.0", default-features = false, features = ["macos_fsevent"] }
+open = "5.3.2"
+rand = "0.10"
 regex = "1.11.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "rustls", "stream"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+sha2 = "0.11.0"
 toml = "1.1.2"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
@@ -44,5 +48,7 @@ features = [
   "process",
   "rt",
   "rt-multi-thread",
+  "net",
   "sync",
+  "time",
 ]

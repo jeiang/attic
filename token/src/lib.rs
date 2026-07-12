@@ -97,6 +97,7 @@ pub use jwt_simple::{
     prelude::UnixTimeStamp,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use serde_with::{BoolFromInt, serde_as};
 
 use attic::cache::{CacheName, CacheNamePattern};
@@ -243,6 +244,14 @@ pub enum SignatureType {
     RS256PubkeyOnly(RS256PublicKey),
 }
 
+/// A validated OIDC ID token.
+///
+/// Unlike Attic tokens, OIDC tokens do not carry an Attic-specific custom
+/// claim.  Their non-standard claims are kept as JSON so that the server can
+/// apply its configured authorization rules after signature verification.
+#[derive(Debug)]
+pub struct OidcToken(JWTClaims<JsonValue>);
+
 impl Token {
     /// Verifies and decodes a token.
     pub fn from_jwt(
@@ -386,6 +395,46 @@ impl Token {
 
     fn attic_access_mut(&mut self) -> &mut AtticAccess {
         &mut self.0.custom.attic_ns
+    }
+}
+
+impl OidcToken {
+    /// Verifies an RS256 OIDC ID token and returns its claims.
+    pub fn from_rs256_jwt(
+        token: &str,
+        key: &RS256PublicKey,
+        issuer: &str,
+        audience: &str,
+    ) -> Result<Self> {
+        let opts = VerificationOptions {
+            reject_before: None,
+            accept_future: false,
+            required_subject: None,
+            required_key_id: None,
+            required_public_key: None,
+            required_nonce: None,
+            allowed_issuers: Some([issuer.to_owned()].into()),
+            allowed_audiences: Some([audience.to_owned()].into()),
+            time_tolerance: None,
+            max_validity: None,
+            max_token_length: None,
+            max_header_length: None,
+            artificial_time: None,
+        };
+
+        key.verify_token(token, Some(opts))
+            .map(Self)
+            .map_err(Error::TokenError)
+    }
+
+    /// Returns the subject claim.
+    pub fn sub(&self) -> Option<&str> {
+        self.0.subject.as_deref()
+    }
+
+    /// Returns the provider-defined claims.
+    pub fn claims(&self) -> &JsonValue {
+        &self.0.custom
     }
 }
 

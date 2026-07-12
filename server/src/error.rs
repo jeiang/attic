@@ -38,6 +38,12 @@ pub enum ErrorKind {
     /// Unauthorized.
     Unauthorized,
 
+    /// Authenticated but not authorized.
+    Forbidden,
+
+    /// A required upstream service is unavailable.
+    ServiceUnavailable,
+
     /// The server encountered an internal error or misconfiguration.
     InternalServerError,
 
@@ -171,6 +177,8 @@ impl ErrorKind {
         match self {
             Self::NotFound => "NotFound",
             Self::Unauthorized => "Unauthorized",
+            Self::Forbidden => "Forbidden",
+            Self::ServiceUnavailable => "ServiceUnavailable",
             Self::InternalServerError => "InternalServerError",
 
             Self::NoSuchObject => "NoSuchObject",
@@ -216,6 +224,8 @@ impl ErrorKind {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
 
             Self::AccessError(_) => StatusCode::FORBIDDEN,

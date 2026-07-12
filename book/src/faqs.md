@@ -29,6 +29,9 @@ Path metadata (store path, references, deriver, etc.) are associated with the lo
 ## How is authentication handled?
 
 Authentication is done via signed JWTs containing the allowed permissions.
+OIDC providers can also exchange verified ID tokens for short-lived signed
+Attic tokens; authorization remains stateless and is evaluated at exchange
+time.
 Each instance of `atticd --mode api-server` is stateless.
 This design may be revisited later, with option for a more stateful method of authentication.
 

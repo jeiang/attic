@@ -164,3 +164,25 @@ token-rs256-secret-base64 = "%token_rs256_secret_base64%"
 # You can also set it via the `ATTIC_SERVER_TOKEN_HS256_SECRET_BASE64`
 # environment variable.
 #token-hs256-secret-base64 = ""
+
+# OpenID Connect providers can exchange a verified ID token for a short-lived
+# Attic token. Existing atticadm-generated tokens continue to work.
+#
+# [[oidc.providers]]
+# name = "pocketid"
+# mode = "authorization-code-pkce"
+# issuer = "https://id.example.com"
+# audience = "your-pocket-id-client-id"
+# jwks-url = "https://id.example.com/.well-known/jwks.json"
+# authorization-endpoint = "https://id.example.com/authorize"
+# token-endpoint = "https://id.example.com/api/oidc/token"
+# scopes = ["openid", "profile", "groups"]
+# token-validity = "12 hours"
+#
+# [[oidc.providers.rules]]
+# claims = { groups = "attic-users" }
+# caches = { "my-cache" = { r = 1, w = 1 } }
+#
+# GitHub Actions uses a provider with mode = "github-actions". Configure its
+# audience to this Attic endpoint and match immutable repository_id plus an
+# explicitly trusted protected ref before granting push permission.

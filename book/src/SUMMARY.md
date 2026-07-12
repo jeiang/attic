@@ -5,6 +5,7 @@
 - [User Guide](./user-guide/README.md)
 - [Admin Guide](./admin-guide/README.md)
     - [Deploying to NixOS](./admin-guide/deployment/nixos.md)
+    - [OIDC Authentication](./admin-guide/oidc.md)
     - [Chunking](./admin-guide/chunking.md)
 - [FAQs](./faqs.md)
 - [Reference](./reference/README.md)
