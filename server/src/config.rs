@@ -110,6 +110,26 @@ pub struct Config {
     #[serde(default = "default_max_nar_info_size")]
     pub max_nar_info_size: usize,
 
+    /// The maximum number of `upload_path` requests that may be in flight
+    /// at once, server-wide.
+    ///
+    /// If unset (default), there is no limit, preserving the existing
+    /// behavior. In memory-constrained deployments, set this to a value
+    /// sized for your pod's memory limit to bound peak memory usage during
+    /// concurrent NAR uploads.
+    #[serde(rename = "max-concurrent-uploads")]
+    #[serde(default)]
+    pub max_concurrent_uploads: Option<usize>,
+
+    /// The maximum number of chunks that may be uploaded to the storage
+    /// backend concurrently, server-wide.
+    ///
+    /// This is a global limit shared across all in-flight uploads, not a
+    /// per-request limit.
+    #[serde(rename = "max-concurrent-chunk-uploads")]
+    #[serde(default = "default_max_concurrent_chunk_uploads")]
+    pub max_concurrent_chunk_uploads: usize,
+
     /// Database connection.
     pub database: DatabaseConfig,
 
@@ -710,6 +730,10 @@ fn default_default_retention_period() -> Duration {
 
 fn default_max_nar_info_size() -> usize {
     1024 * 1024 // 1 MiB
+}
+
+fn default_max_concurrent_chunk_uploads() -> usize {
+    10
 }
 
 fn default_oidc_scopes() -> Vec<String> {

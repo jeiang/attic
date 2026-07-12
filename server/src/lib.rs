@@ -44,6 +44,7 @@ use sea_orm::{
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
+use tokio::sync::Semaphore;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -74,6 +75,16 @@ pub struct StateInner {
 
     /// Cached JSON Web Key Sets for OIDC providers.
     oidc_keysets: Mutex<HashMap<String, CachedOidcKeyset>>,
+
+    /// Global semaphore bounding the number of concurrent `upload_path`
+    /// requests.
+    ///
+    /// `None` means unlimited (the default, preserving prior behavior).
+    upload_permits: Option<Arc<Semaphore>>,
+
+    /// Global semaphore bounding the number of chunks concurrently being
+    /// uploaded to the storage backend, across all requests.
+    chunk_upload_permits: Arc<Semaphore>,
 }
 
 /// An OIDC JSON Web Key Set cached until its next refresh.
@@ -110,11 +121,18 @@ struct RequestStateInner {
 
 impl StateInner {
     async fn new(config: Config) -> State {
+        let upload_permits = config
+            .max_concurrent_uploads
+            .map(|n| Arc::new(Semaphore::new(n)));
+        let chunk_upload_permits = Arc::new(Semaphore::new(config.max_concurrent_chunk_uploads));
+
         Arc::new(Self {
             config,
             database: OnceCell::new(),
             storage: OnceCell::new(),
             oidc_keysets: Mutex::new(HashMap::new()),
+            upload_permits,
+            chunk_upload_permits,
         })
     }
 
@@ -166,6 +184,24 @@ impl StateInner {
                 }
             })
             .await
+    }
+
+    /// Acquires a permit against the global upload concurrency budget.
+    ///
+    /// Returns `None` if `max-concurrent-uploads` is unconfigured, meaning
+    /// there is no limit. The returned guard should be held for the
+    /// duration of the upload request.
+    async fn acquire_upload_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.upload_permits {
+            Some(semaphore) => Some(
+                semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("Upload semaphore should never be closed"),
+            ),
+            None => None,
+        }
     }
 
     /// Sends periodic heartbeat queries to the database.

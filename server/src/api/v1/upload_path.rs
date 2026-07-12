@@ -2,7 +2,6 @@ use std::io;
 
 use std::io::Cursor;
 use std::marker::Unpin;
-use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_compression::Level as CompressionLevel;
@@ -21,7 +20,6 @@ use sea_orm::entity::prelude::*;
 use sea_orm::{QuerySelect, TransactionTrait};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncReadExt};
-use tokio::sync::Semaphore;
 use tokio::task::spawn;
 use tokio_util::io::StreamReader;
 use tracing::instrument;
@@ -49,11 +47,6 @@ use crate::database::entity::chunkref::{self, Entity as ChunkRef};
 use crate::database::entity::nar::{self, Entity as Nar, NarState};
 use crate::database::entity::object::{self, Entity as Object, InsertExt};
 use crate::database::{AtticDatabase, ChunkGuard, NarGuard};
-
-/// Number of chunks to upload to the storage backend at once.
-///
-/// TODO: Make this configurable
-const CONCURRENT_CHUNK_UPLOADS: usize = 10;
 
 /// Data of a chunk.
 enum ChunkData {
@@ -89,6 +82,12 @@ pub(crate) async fn upload_path(
     headers: HeaderMap,
     body: Body,
 ) -> ServerResult<Json<UploadPathResult>> {
+    // Acquire a permit against the global upload concurrency budget, held
+    // for the remainder of this request (covering both the chunked and
+    // unchunked upload paths). Released automatically (RAII) on completion
+    // or on any early return/abort.
+    let _upload_permit = state.acquire_upload_permit().await;
+
     let stream = body.into_data_stream();
     let mut stream =
         StreamReader::new(stream.map(|r| r.map_err(|e| io::Error::other(e.to_string()))));
@@ -321,7 +320,7 @@ async fn upload_path_new_chunked(
         chunking_config.max_size,
     );
 
-    let upload_chunk_limit = Arc::new(Semaphore::new(CONCURRENT_CHUNK_UPLOADS));
+    let upload_chunk_limit = state.chunk_upload_permits.clone();
     let mut futures = Vec::new();
 
     let mut chunk_idx = 0;
