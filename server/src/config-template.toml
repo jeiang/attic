@@ -28,11 +28,11 @@ allowed-hosts = []
 # If unset (default), there is no limit. In memory-constrained deployments,
 # set this to a value sized for your pod's memory limit to bound peak
 # memory usage during concurrent NAR uploads (e.g., 2-4 for a 256-512 MiB
-# pod).
+# pod). Must be greater than zero if set.
 #max-concurrent-uploads = 4
 
 # The maximum number of chunks that may be uploaded to the storage backend
-# concurrently, server-wide (not per-request).
+# concurrently, server-wide (not per-request). Must be greater than zero.
 #max-concurrent-chunk-uploads = 10
 
 # Whether to soft-delete caches

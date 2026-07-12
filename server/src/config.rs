@@ -749,6 +749,7 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
 
     let config = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&config)?;
+    validate_concurrency_config(&config)?;
     validate_oidc_config(&config)?;
     Ok(config)
 }
@@ -756,8 +757,23 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
 fn load_config_from_str(s: &str) -> Result<Config> {
     tracing::info!("Using configurations from environment variable");
     let config: Config = toml::from_str(s)?;
+    validate_concurrency_config(&config)?;
     validate_oidc_config(&config)?;
     Ok(config)
+}
+
+fn validate_concurrency_config(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        config.max_concurrent_uploads != Some(0),
+        "max-concurrent-uploads must be greater than zero \
+        (unset the option to allow unlimited concurrent uploads)"
+    );
+    anyhow::ensure!(
+        config.max_concurrent_chunk_uploads != 0,
+        "max-concurrent-chunk-uploads must be greater than zero"
+    );
+
+    Ok(())
 }
 
 fn validate_oidc_config(config: &Config) -> Result<()> {
