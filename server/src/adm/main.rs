@@ -1,3 +1,5 @@
+#[path = "../alloc.rs"]
+mod alloc;
 mod command;
 
 use std::path::PathBuf;

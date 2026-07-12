@@ -39,7 +39,8 @@ use axum::{
     http::{Uri, uri::Scheme},
 };
 use sea_orm::{
-    ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType, query::Statement,
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType,
+    query::Statement,
 };
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
@@ -73,8 +74,8 @@ pub struct StateInner {
     /// Handle to the storage backend.
     storage: OnceCell<Arc<StorageBackendImpl>>,
 
-    /// Limits whole authenticated uploads across all requests.
-    upload_permits: Arc<Semaphore>,
+    /// Limits whole authenticated uploads across all requests when configured.
+    upload_permits: Option<Arc<Semaphore>>,
 
     /// Limits chunk uploads to storage across all requests.
     chunk_upload_permits: Arc<Semaphore>,
@@ -123,9 +124,10 @@ pub(crate) struct RequestId(pub Uuid);
 
 impl StateInner {
     async fn new(config: Config) -> State {
-        let upload_permits = Arc::new(Semaphore::new(config.uploads.concurrent_uploads));
-        let chunk_upload_permits =
-            Arc::new(Semaphore::new(config.uploads.concurrent_chunk_uploads));
+        let upload_permits = config
+            .max_concurrent_uploads
+            .map(|n| Arc::new(Semaphore::new(n)));
+        let chunk_upload_permits = Arc::new(Semaphore::new(config.max_concurrent_chunk_uploads));
 
         Arc::new(Self {
             config,
@@ -141,7 +143,18 @@ impl StateInner {
     async fn database(&self) -> ServerResult<&DatabaseConnection> {
         self.database
             .get_or_try_init(|| async {
-                let db = Database::connect(&self.config.database.url)
+                let mut connect_options = ConnectOptions::new(self.config.database.url.clone());
+                if let Some(max_connections) = self.config.database.max_connections {
+                    connect_options.max_connections(max_connections);
+                }
+                if let Some(min_connections) = self.config.database.min_connections {
+                    connect_options.min_connections(min_connections);
+                }
+                if let Some(idle_timeout) = self.config.database.idle_timeout {
+                    connect_options.idle_timeout(idle_timeout);
+                }
+
+                let db = Database::connect(connect_options)
                     .await
                     .map_err(ServerError::database_error);
                 if let Ok(db_conn) = &db
@@ -152,21 +165,36 @@ impl StateInner {
                     // more details
                     // intentionally ignore errors from this: this is purely for performance,
                     // not for correctness, so we can live without this
+                    let mmap_size = self.config.database.mmap_size;
                     _ = conn
-                        .execute_unprepared(
+                        .execute_unprepared(&format!(
                             "
                         pragma journal_mode=WAL;
                         pragma synchronous=normal;
                         pragma temp_store=memory;
-                        pragma mmap_size = 30000000000;
-                        ",
-                        )
+                        pragma mmap_size = {mmap_size};
+                        "
+                        ))
                         .await;
                 }
 
                 db
             })
             .await
+    }
+
+    /// Acquires the configured global upload permit, if enabled.
+    async fn acquire_upload_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.upload_permits {
+            Some(semaphore) => Some(
+                semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("upload semaphore is never closed"),
+            ),
+            None => None,
+        }
     }
 
     /// Returns a handle to the storage backend.

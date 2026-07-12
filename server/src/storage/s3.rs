@@ -1,5 +1,6 @@
 //! S3 remote files.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -16,6 +17,7 @@ use bytes::BytesMut;
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
+use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use super::{Download, RemoteFile, StorageBackend};
@@ -25,6 +27,9 @@ use attic::util::Finally;
 
 /// The chunk size for each part in a multipart upload.
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Avoid allocating a full multipart buffer for the common small-object case.
+const INITIAL_READ_SIZE: usize = 512 * 1024;
 
 /// The S3 remote file storage backend.
 #[derive(Debug)]
@@ -193,10 +198,20 @@ impl StorageBackend for S3Backend {
         name: String,
         mut stream: &mut (dyn AsyncRead + Unpin + Send),
     ) -> ServerResult<RemoteFile> {
-        let buf = BytesMut::with_capacity(CHUNK_SIZE);
-        let first_chunk = read_chunk_async(&mut stream, buf)
+        let buf = BytesMut::with_capacity(INITIAL_READ_SIZE);
+        let small_chunk = read_chunk_async(&mut stream, buf)
             .await
             .map_err(ServerError::storage_error)?;
+
+        let first_chunk = if small_chunk.len() < INITIAL_READ_SIZE {
+            small_chunk
+        } else {
+            let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
+            buf.extend_from_slice(&small_chunk);
+            read_chunk_async(&mut stream, buf)
+                .await
+                .map_err(ServerError::storage_error)?
+        };
 
         if first_chunk.len() < CHUNK_SIZE {
             // do a normal PutObject
@@ -257,6 +272,7 @@ impl StorageBackend for S3Backend {
         });
 
         let mut part_number = 1;
+        let part_limit = Arc::new(Semaphore::new(self.config.multipart_concurrency));
         let mut parts = FuturesUnordered::new();
         let mut completed_parts = Vec::new();
         let mut first_chunk = Some(first_chunk);
@@ -267,6 +283,12 @@ impl StorageBackend for S3Backend {
             if parts.len() == self.config.multipart_concurrency {
                 completed_parts.push(parts.next().await.expect("part queue is non-empty")?);
             }
+
+            let permit = part_limit
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("multipart semaphore is never closed");
 
             let chunk = if part_number == 1 {
                 first_chunk.take().unwrap()
@@ -286,6 +308,7 @@ impl StorageBackend for S3Backend {
             let key = name.clone();
             let upload_id = upload_id.to_owned();
             parts.push(async move {
+                let _permit = permit;
                 let part = client
                     .upload_part()
                     .bucket(bucket)

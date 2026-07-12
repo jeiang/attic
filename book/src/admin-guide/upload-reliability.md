@@ -39,17 +39,17 @@ standard when forwarding request IDs.
 
 ## Concurrency settings
 
-The server configuration has global limits under `[uploads]`:
+The server configuration has global limits at the top level:
 
 ```toml
-[uploads]
-concurrent-uploads = 16
-concurrent-chunk-uploads = 10
+max-concurrent-uploads = 16
+max-concurrent-chunk-uploads = 10
 ```
 
-Both values must be greater than zero. The whole-upload limit is acquired only
+`max-concurrent-uploads` may be omitted to leave whole uploads unlimited; if
+set, it must be greater than zero. The whole-upload limit is acquired only
 after authentication. Chunk uploads retain the request-local bound and also use
-the global chunk limit.
+the global chunk limit, which must be greater than zero.
 
 For S3-compatible storage, `multipart-concurrency` bounds in-flight multipart
 parts and buffered read-ahead bodies:

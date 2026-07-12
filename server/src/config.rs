@@ -110,6 +110,17 @@ pub struct Config {
     #[serde(default = "default_max_nar_info_size")]
     pub max_nar_info_size: usize,
 
+    /// Maximum concurrent authenticated uploads. If unset, uploads are not
+    /// globally limited.
+    #[serde(rename = "max-concurrent-uploads")]
+    #[serde(default)]
+    pub max_concurrent_uploads: Option<usize>,
+
+    /// Maximum chunks uploaded to storage concurrently across all requests.
+    #[serde(rename = "max-concurrent-chunk-uploads")]
+    #[serde(default = "default_max_concurrent_chunk_uploads")]
+    pub max_concurrent_chunk_uploads: usize,
+
     /// Database connection.
     pub database: DatabaseConfig,
 
@@ -118,10 +129,6 @@ pub struct Config {
 
     /// Data chunking.
     pub chunking: ChunkingConfig,
-
-    /// Upload concurrency limits.
-    #[serde(default = "Default::default")]
-    pub uploads: UploadConfig,
 
     /// Compression.
     #[serde(default = "Default::default")]
@@ -364,6 +371,27 @@ pub struct DatabaseConfig {
     /// If enabled, a heartbeat query will be sent every minute.
     #[serde(default = "default_db_heartbeat")]
     pub heartbeat: bool,
+
+    /// The SQLite `mmap_size` pragma, in bytes.
+    #[serde(rename = "mmap-size")]
+    #[serde(default = "default_db_mmap_size")]
+    pub mmap_size: u64,
+
+    /// Maximum connections in the database pool.
+    #[serde(rename = "max-connections")]
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+
+    /// Minimum connections retained in the database pool.
+    #[serde(rename = "min-connections")]
+    #[serde(default)]
+    pub min_connections: Option<u32>,
+
+    /// Maximum connection idle time.
+    #[serde(rename = "idle-timeout")]
+    #[serde(with = "humantime_serde::option")]
+    #[serde(default)]
+    pub idle_timeout: Option<Duration>,
 }
 
 /// File storage configuration.
@@ -417,31 +445,6 @@ pub struct ChunkingConfig {
     /// The preferred maximum size of a chunk, in bytes.
     #[serde(rename = "max-size")]
     pub max_size: usize,
-}
-
-/// Upload concurrency limits.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UploadConfig {
-    /// Maximum number of authenticated uploads processed at once.
-    #[serde(rename = "concurrent-uploads", default = "default_concurrent_uploads")]
-    pub concurrent_uploads: usize,
-
-    /// Maximum number of chunks uploaded to storage across all requests at once.
-    #[serde(
-        rename = "concurrent-chunk-uploads",
-        default = "default_concurrent_chunk_uploads"
-    )]
-    pub concurrent_chunk_uploads: usize,
-}
-
-impl Default for UploadConfig {
-    fn default() -> Self {
-        Self {
-            concurrent_uploads: default_concurrent_uploads(),
-            concurrent_chunk_uploads: default_concurrent_chunk_uploads(),
-        }
-    }
 }
 
 /// Compression configuration.
@@ -741,12 +744,12 @@ fn default_max_nar_info_size() -> usize {
     1024 * 1024 // 1 MiB
 }
 
-fn default_concurrent_uploads() -> usize {
-    16
+fn default_max_concurrent_chunk_uploads() -> usize {
+    10
 }
 
-fn default_concurrent_chunk_uploads() -> usize {
-    10
+fn default_db_mmap_size() -> u64 {
+    512 * 1024 * 1024
 }
 
 fn default_oidc_scopes() -> Vec<String> {
@@ -774,22 +777,50 @@ fn load_config_from_str(s: &str) -> Result<Config> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    validate_upload_config(&config.uploads)?;
+    validate_concurrency_config(config)?;
     if let StorageConfig::S3(s3) = &config.storage {
         s3.validate()?;
     }
-    validate_oidc_config(config)
+    validate_oidc_config(config)?;
+    validate_database_config(config)
 }
 
-fn validate_upload_config(config: &UploadConfig) -> Result<()> {
+fn validate_concurrency_config(config: &Config) -> Result<()> {
+    validate_concurrency_values(
+        config.max_concurrent_uploads,
+        config.max_concurrent_chunk_uploads,
+    )
+}
+
+fn validate_concurrency_values(
+    max_concurrent_uploads: Option<usize>,
+    max_concurrent_chunk_uploads: usize,
+) -> Result<()> {
     anyhow::ensure!(
-        config.concurrent_uploads > 0,
-        "uploads.concurrent-uploads must be greater than zero"
+        max_concurrent_uploads != Some(0),
+        "max-concurrent-uploads must be greater than zero (unset it to disable the limit)"
     );
     anyhow::ensure!(
-        config.concurrent_chunk_uploads > 0,
-        "uploads.concurrent-chunk-uploads must be greater than zero"
+        max_concurrent_chunk_uploads > 0,
+        "max-concurrent-chunk-uploads must be greater than zero"
     );
+    Ok(())
+}
+
+fn validate_database_config(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        config.database.max_connections != Some(0),
+        "database.max-connections must be greater than zero (unset it to use the default pool size)"
+    );
+    if let (Some(min), Some(max)) = (
+        config.database.min_connections,
+        config.database.max_connections,
+    ) {
+        anyhow::ensure!(
+            min <= max,
+            "database.min-connections ({min}) must not exceed database.max-connections ({max})"
+        );
+    }
     Ok(())
 }
 
@@ -846,7 +877,7 @@ fn validate_oidc_config(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod oidc_tests {
-    use super::{OidcClaimValue, UploadConfig, validate_upload_config};
+    use super::{OidcClaimValue, validate_concurrency_values};
     use serde_json::json;
 
     #[test]
@@ -860,25 +891,9 @@ mod oidc_tests {
 
     #[test]
     fn upload_limits_default_and_reject_zero() {
-        let defaults = UploadConfig::default();
-        assert_eq!(defaults.concurrent_uploads, 16);
-        assert_eq!(defaults.concurrent_chunk_uploads, 10);
-        assert!(validate_upload_config(&defaults).is_ok());
-
-        assert!(
-            validate_upload_config(&UploadConfig {
-                concurrent_uploads: 0,
-                ..defaults.clone()
-            })
-            .is_err()
-        );
-        assert!(
-            validate_upload_config(&UploadConfig {
-                concurrent_chunk_uploads: 0,
-                ..defaults
-            })
-            .is_err()
-        );
+        assert!(validate_concurrency_values(None, 10).is_ok());
+        assert!(validate_concurrency_values(Some(0), 10).is_err());
+        assert!(validate_concurrency_values(None, 0).is_err());
     }
 }
 

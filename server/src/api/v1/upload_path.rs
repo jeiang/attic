@@ -235,12 +235,7 @@ async fn upload_path_inner(
     // Authentication is intentionally completed before this permit is acquired
     // so unauthenticated requests cannot exhaust the upload budget.
     let permit_started = Instant::now();
-    let _upload_permit = state
-        .upload_permits
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("upload semaphore is never closed");
+    let _upload_permit = state.acquire_upload_permit().await;
     span.record(
         "permit_wait_ms",
         permit_started.elapsed().as_millis() as u64,
