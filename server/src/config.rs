@@ -775,6 +775,9 @@ fn load_config_from_str(s: &str) -> Result<Config> {
 
 fn validate_config(config: &Config) -> Result<()> {
     validate_upload_config(&config.uploads)?;
+    if let StorageConfig::S3(s3) = &config.storage {
+        s3.validate()?;
+    }
     validate_oidc_config(config)
 }
 

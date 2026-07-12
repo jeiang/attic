@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use anyhow::Result;
 use aws_config::{BehaviorVersion, retry::RetryConfig};
 use aws_sdk_s3::{
     Client,
@@ -12,7 +13,7 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
 };
 use bytes::BytesMut;
-use futures::future::join_all;
+use futures::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
@@ -50,6 +51,13 @@ pub struct S3StorageConfig {
     /// If not specified, it's read from the `AWS_ACCESS_KEY_ID` and
     /// `AWS_SECRET_ACCESS_KEY` environment variables.
     credentials: Option<S3CredentialsConfig>,
+
+    /// Maximum number of multipart part uploads in flight.
+    #[serde(
+        rename = "multipart-concurrency",
+        default = "default_multipart_concurrency"
+    )]
+    multipart_concurrency: usize,
 }
 
 /// S3 credential configuration.
@@ -164,6 +172,20 @@ impl S3Backend {
     }
 }
 
+impl S3StorageConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.multipart_concurrency > 0,
+            "storage.multipart-concurrency must be greater than zero"
+        );
+        Ok(())
+    }
+}
+
+fn default_multipart_concurrency() -> usize {
+    4
+}
+
 impl StorageBackend for S3Backend {
     async fn upload_file(
         &self,
@@ -231,10 +253,17 @@ impl StorageBackend for S3Backend {
         });
 
         let mut part_number = 1;
-        let mut parts = Vec::new();
+        let mut parts = FuturesUnordered::new();
+        let mut completed_parts = Vec::new();
         let mut first_chunk = Some(first_chunk);
 
         loop {
+            // Do not read another part until there is space for it. The body
+            // held by each future is the only multipart read-ahead buffer.
+            if parts.len() == self.config.multipart_concurrency {
+                completed_parts.push(parts.next().await.expect("part queue is non-empty")?);
+            }
+
             let chunk = if part_number == 1 {
                 first_chunk.take().unwrap()
             } else {
@@ -249,34 +278,38 @@ impl StorageBackend for S3Backend {
             }
 
             let client = self.client.clone();
-            let fut = tokio::task::spawn({
-                client
+            let bucket = self.config.bucket.clone();
+            let key = name.clone();
+            let upload_id = upload_id.to_owned();
+            parts.push(async move {
+                let part = client
                     .upload_part()
-                    .bucket(&self.config.bucket)
-                    .key(&name)
+                    .bucket(bucket)
+                    .key(key)
                     .upload_id(upload_id)
                     .part_number(part_number)
-                    .body(chunk.clone().into())
+                    .body(chunk.into())
                     .send()
+                    .await
+                    .map_err(ServerError::storage_error)?;
+
+                Ok::<CompletedPart, ServerError>(
+                    CompletedPart::builder()
+                        .set_e_tag(part.e_tag().map(str::to_string))
+                        .set_part_number(Some(part_number))
+                        .build(),
+                )
             });
 
-            parts.push(fut);
             part_number += 1;
         }
 
-        let uploaded_parts = join_all(parts).await;
-        let mut completed_parts = Vec::with_capacity(uploaded_parts.len());
-
-        for (idx, join_result) in uploaded_parts.into_iter().enumerate() {
-            let part = join_result.unwrap().map_err(ServerError::storage_error)?;
-            let part_number = idx + 1;
-            completed_parts.push(
-                CompletedPart::builder()
-                    .set_e_tag(part.e_tag().map(str::to_string))
-                    .set_part_number(Some(part_number as i32))
-                    .build(),
-            );
+        // `parts` is request-owned. On an error, dropping it cancels every
+        // remaining request before `cleanup` aborts the multipart upload.
+        while let Some(part) = parts.next().await {
+            completed_parts.push(part?);
         }
+        completed_parts.sort_by_key(|part| part.part_number().unwrap_or_default());
 
         let completed_multipart_upload = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
@@ -353,5 +386,33 @@ impl StorageBackend for S3Backend {
             bucket: self.config.bucket.clone(),
             key: name,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::S3StorageConfig;
+
+    #[test]
+    fn multipart_concurrency_defaults_and_rejects_zero() {
+        let config: S3StorageConfig = toml::from_str(
+            r#"
+                region = "test-region"
+                bucket = "test-bucket"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.multipart_concurrency, 4);
+        assert!(config.validate().is_ok());
+
+        let zero: S3StorageConfig = toml::from_str(
+            r#"
+                region = "test-region"
+                bucket = "test-bucket"
+                multipart-concurrency = 0
+            "#,
+        )
+        .unwrap();
+        assert!(zero.validate().is_err());
     }
 }
