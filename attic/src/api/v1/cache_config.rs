@@ -2,7 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::CacheName;
 use crate::signing::NixKeypair;
+
+/// List of caches discoverable by the caller.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListCachesResponse {
+    /// Cache names, sorted lexicographically.
+    pub caches: Vec<CacheName>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateCacheRequest {

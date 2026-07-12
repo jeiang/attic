@@ -5,7 +5,7 @@ use axum::extract::{Extension, Json, Path};
 use chrono::Utc;
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use tracing::instrument;
 
 use crate::database::entity::Json as DbJson;
@@ -13,10 +13,41 @@ use crate::database::entity::cache::{self, Entity as Cache};
 use crate::error::{ErrorKind, ServerError, ServerResult};
 use crate::{RequestState, State};
 use attic::api::v1::cache_config::{
-    CacheConfig, CreateCacheRequest, KeypairConfig, RetentionPeriodConfig,
+    CacheConfig, CreateCacheRequest, KeypairConfig, ListCachesResponse, RetentionPeriodConfig,
 };
 use attic::cache::CacheName;
 use attic::signing::NixKeypair;
+
+#[instrument(skip_all)]
+pub(crate) async fn list_caches(
+    Extension(state): Extension<State>,
+    Extension(req_state): Extension<RequestState>,
+) -> ServerResult<Json<ListCachesResponse>> {
+    let database = state.database().await?;
+    let caches = Cache::find()
+        .filter(cache::Column::DeletedAt.is_null())
+        .order_by_asc(cache::Column::Name)
+        .all(database)
+        .await
+        .map_err(ServerError::database_error)?;
+
+    let caches = caches
+        .into_iter()
+        .map(|cache| {
+            let name = CacheName::new(cache.name)?;
+            Ok(req_state
+                .auth
+                .get_permission_for_cache(&name, cache.is_public)
+                .can_discover()
+                .then_some(name))
+        })
+        .collect::<ServerResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(Json(ListCachesResponse { caches }))
+}
 
 #[instrument(skip_all, fields(cache_name))]
 pub(crate) async fn get_cache_config(
