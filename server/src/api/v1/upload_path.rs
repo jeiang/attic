@@ -2,6 +2,8 @@ use std::io;
 
 use std::io::Cursor;
 use std::marker::Unpin;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use async_compression::Level as CompressionLevel;
@@ -14,15 +16,15 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures::StreamExt;
-use futures::future::join_all;
+use futures::stream::FuturesUnordered;
 use sea_orm::ActiveValue::Set;
 use sea_orm::entity::prelude::*;
 use sea_orm::{QuerySelect, TransactionTrait};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncReadExt};
-use tokio::task::spawn;
+use tokio::sync::Semaphore;
 use tokio_util::io::StreamReader;
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::compression::{CompressionStream, CompressorFn};
@@ -48,6 +50,11 @@ use crate::database::entity::nar::{self, Entity as Nar, NarState};
 use crate::database::entity::object::{self, Entity as Object, InsertExt};
 use crate::database::{AtticDatabase, ChunkGuard, NarGuard};
 
+/// Number of chunks to upload to the storage backend at once.
+///
+/// TODO: Make this configurable
+const CONCURRENT_CHUNK_UPLOADS: usize = 10;
+
 /// Data of a chunk.
 enum ChunkData {
     /// Some bytes in memory.
@@ -67,6 +74,60 @@ trait UploadPathNarInfoExt {
     fn to_active_model(&self) -> object::ActiveModel;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UploadLifecycleOutcome {
+    Success,
+    Error,
+    Cancelled,
+}
+
+struct UploadLifecycleGuard<F: FnMut(UploadLifecycleOutcome, u128)> {
+    started: Instant,
+    span: tracing::Span,
+    emit: F,
+    completed: bool,
+}
+
+impl UploadLifecycleGuard<fn(UploadLifecycleOutcome, u128)> {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            span: tracing::Span::current(),
+            emit: emit_upload_lifecycle,
+            completed: false,
+        }
+    }
+}
+
+impl<F: FnMut(UploadLifecycleOutcome, u128)> UploadLifecycleGuard<F> {
+    fn complete(&mut self, outcome: UploadLifecycleOutcome) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let elapsed_ms = self.started.elapsed().as_millis();
+        self.span.in_scope(|| (self.emit)(outcome, elapsed_ms));
+    }
+}
+
+impl<F: FnMut(UploadLifecycleOutcome, u128)> Drop for UploadLifecycleGuard<F> {
+    fn drop(&mut self) {
+        self.complete(UploadLifecycleOutcome::Cancelled);
+    }
+}
+
+fn emit_upload_lifecycle(outcome: UploadLifecycleOutcome, elapsed_ms: u128) {
+    tracing::info!(
+        status = match outcome {
+            UploadLifecycleOutcome::Success => "success",
+            UploadLifecycleOutcome::Error => "error",
+            UploadLifecycleOutcome::Cancelled => "cancelled",
+        },
+        elapsed_ms,
+        "Upload lifecycle completed"
+    );
+}
+
 /// Uploads a new object to the cache.
 ///
 /// When clients request to upload an object, we first try to increment
@@ -74,7 +135,16 @@ trait UploadPathNarInfoExt {
 /// updated, it means the NAR exists in the global cache and we can deduplicate
 /// after confirming the NAR hash ("Deduplicate" case). Otherwise, we perform
 /// a new upload to the storage backend ("New NAR" case).
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(
+    request_id = %req_state.request_id,
+    cache,
+    store_path_hash,
+    declared_bytes,
+    received_bytes,
+    permit_wait_ms,
+    chunk_count,
+    status
+))]
 #[axum_macros::debug_handler]
 pub(crate) async fn upload_path(
     Extension(state): Extension<State>,
@@ -82,12 +152,22 @@ pub(crate) async fn upload_path(
     headers: HeaderMap,
     body: Body,
 ) -> ServerResult<Json<UploadPathResult>> {
-    // Acquire a permit against the global upload concurrency budget, held
-    // for the remainder of this request (covering both the chunked and
-    // unchunked upload paths). Released automatically (RAII) on completion
-    // or on any early return/abort.
-    let _upload_permit = state.acquire_upload_permit().await;
+    let mut lifecycle = UploadLifecycleGuard::new();
+    let result = upload_path_inner(state, req_state, headers, body).await;
+    lifecycle.complete(if result.is_ok() {
+        UploadLifecycleOutcome::Success
+    } else {
+        UploadLifecycleOutcome::Error
+    });
+    result
+}
 
+async fn upload_path_inner(
+    state: State,
+    req_state: RequestState,
+    headers: HeaderMap,
+    body: Body,
+) -> ServerResult<Json<UploadPathResult>> {
     let stream = body.into_data_stream();
     let mut stream =
         StreamReader::new(stream.map(|r| r.map_err(|e| io::Error::other(e.to_string()))));
@@ -136,6 +216,10 @@ pub(crate) async fn upload_path(
         }
     };
     let cache_name = &upload_info.cache;
+    let span = tracing::Span::current();
+    span.record("cache", cache_name.as_str());
+    span.record("store_path_hash", upload_info.store_path_hash.as_str());
+    span.record("declared_bytes", upload_info.nar_size);
 
     let database = state.database().await?;
     let cache = req_state
@@ -147,6 +231,15 @@ pub(crate) async fn upload_path(
         .await?;
 
     let username = req_state.auth.username().map(str::to_string);
+
+    // Authentication is intentionally completed before this permit is acquired
+    // so unauthenticated requests cannot exhaust the upload budget.
+    let permit_started = Instant::now();
+    let _upload_permit = state.acquire_upload_permit().await;
+    span.record(
+        "permit_wait_ms",
+        permit_started.elapsed().as_millis() as u64,
+    );
 
     // Try to acquire a lock on an existing NAR
     if let Some(existing_nar) = database.find_and_lock_nar(&upload_info.nar_hash).await? {
@@ -303,12 +396,15 @@ async fn upload_path_new_chunked(
         };
 
         async move {
-            tracing::warn!("Error occurred - Cleaning up NAR entry");
+            tracing::info!(cleanup_outcome = "started", cleanup = "nar", "Upload cleanup started");
 
             if let Err(e) = Nar::delete(nar_model).exec(&database).await {
-                tracing::warn!("Failed to unregister failed NAR: {}", e);
+                tracing::warn!(cleanup_outcome = "failed", cleanup = "nar", error = %e, "Upload cleanup failed");
+            } else {
+                tracing::info!(cleanup_outcome = "succeeded", cleanup = "nar", "Upload cleanup completed");
             }
         }
+        .instrument(tracing::Span::current())
     });
 
     let stream = stream.take(upload_info.nar_size as u64);
@@ -320,11 +416,26 @@ async fn upload_path_new_chunked(
         chunking_config.max_size,
     );
 
-    let upload_chunk_limit = state.chunk_upload_permits.clone();
-    let mut futures = Vec::new();
+    let upload_chunk_limit = Arc::new(Semaphore::new(CONCURRENT_CHUNK_UPLOADS));
+    let mut uploads = FuturesUnordered::new();
+    let mut uploaded_chunks = Vec::new();
 
     let mut chunk_idx = 0;
-    while let Some(bytes) = chunks.next().await {
+    loop {
+        // Poll request-owned upload futures before accepting more data. This
+        // preserves the existing per-request bound without detached work.
+        if uploads.len() == CONCURRENT_CHUNK_UPLOADS {
+            uploaded_chunks.push(
+                uploads
+                    .next()
+                    .await
+                    .expect("the upload queue is non-empty")?,
+            );
+        }
+
+        let Some(bytes) = chunks.next().await else {
+            break;
+        };
         let bytes = bytes.map_err(ServerError::request_error)?;
         let data = ChunkData::Bytes(bytes);
 
@@ -333,12 +444,20 @@ async fn upload_path_new_chunked(
         // We want to block the receive process as well, otherwise it stays ahead and
         // consumes too much memory
         let permit = upload_chunk_limit.clone().acquire_owned().await.unwrap();
-        futures.push({
+        uploads.push({
             let database = database.clone();
             let state = state.clone();
             let require_proof_of_possession = state.config.require_proof_of_possession;
+            let global_upload_limit = state.chunk_upload_permits.clone();
 
-            spawn(async move {
+            async move {
+                // A request-local slot is held while waiting for the global
+                // slot, bounding both active uploads and queued chunk data.
+                let _request_permit = permit;
+                let _global_permit = global_upload_limit
+                    .acquire_owned()
+                    .await
+                    .expect("chunk upload semaphore is never closed");
                 let chunk = upload_chunk(
                     data,
                     compression_type,
@@ -360,9 +479,8 @@ async fn upload_path_new_chunked(
                 .await
                 .map_err(ServerError::database_error)?;
 
-                drop(permit);
-                Ok(chunk)
-            })
+                Ok::<UploadChunkResult, ServerError>(chunk)
+            }
         });
 
         chunk_idx += 1;
@@ -376,13 +494,16 @@ async fn upload_path_new_chunked(
     if nar_hash != upload_info.nar_hash || *nar_size != upload_info.nar_size {
         return Err(ErrorKind::RequestError(anyhow!("Bad NAR Hash or Size")).into());
     }
+    let span = tracing::Span::current();
+    span.record("received_bytes", *nar_size);
 
-    // Wait for all uploads to complete
-    let chunks: Vec<UploadChunkResult> = join_all(futures)
-        .await
-        .into_iter()
-        .map(|join_result| join_result.unwrap())
-        .collect::<ServerResult<Vec<_>>>()?;
+    // Request-owned futures are dropped on any error or client cancellation,
+    // which cancels sibling chunk uploads before the NAR cleanup guard runs.
+    while let Some(chunk) = uploads.next().await {
+        uploaded_chunks.push(chunk?);
+    }
+    let chunks = uploaded_chunks;
+    span.record("chunk_count", chunks.len());
 
     let (file_size, deduplicated_size) =
         chunks
@@ -473,6 +594,9 @@ async fn upload_path_new_unchunked(
         state.config.require_proof_of_possession,
     )
     .await?;
+    let span = tracing::Span::current();
+    span.record("received_bytes", upload_info.nar_size);
+    span.record("chunk_count", 1);
     let file_size = chunk.guard.file_size.unwrap() as usize;
 
     // Finally...
@@ -549,15 +673,36 @@ async fn upload_chunk(
     state: State,
     require_proof_of_possession: bool,
 ) -> ServerResult<UploadChunkResult> {
+    let chunk_started = Instant::now();
     let compression: Compression = compression_type.into();
 
     let given_chunk_hash = data.hash();
     let given_chunk_size = data.size();
 
-    if let Some(existing_chunk) = database
+    let lookup_started = Instant::now();
+    let existing_chunk = match database
         .find_and_lock_chunk(&given_chunk_hash, compression)
-        .await?
+        .await
     {
+        Ok(chunk) => {
+            tracing::debug!(
+                database_operation = "lookup",
+                database_ms = lookup_started.elapsed().as_millis(),
+                "Chunk database lookup completed"
+            );
+            chunk
+        }
+        Err(error) => {
+            tracing::warn!(
+                database_operation = "lookup",
+                database_outcome = "failed",
+                "Chunk database lookup failed"
+            );
+            return Err(error);
+        }
+    };
+
+    if let Some(existing_chunk) = existing_chunk {
         // There's an existing chunk matching the hash
         if require_proof_of_possession && !data.is_hash_trusted() {
             let stream = data.into_async_buf_read();
@@ -580,6 +725,10 @@ async fn upload_chunk(
             }
         }
 
+        tracing::debug!(
+            chunk_total_ms = chunk_started.elapsed().as_millis(),
+            "Chunk lifecycle completed"
+        );
         return Ok(UploadChunkResult {
             guard: existing_chunk,
             deduplicated: true,
@@ -594,6 +743,7 @@ async fn upload_chunk(
 
     let chunk_size_db = i64::try_from(given_chunk_size).map_err(ServerError::request_error)?;
 
+    let pending_insert_started = Instant::now();
     let chunk_id = {
         let model = chunk::ActiveModel {
             state: Set(ChunkState::PendingUpload),
@@ -610,10 +760,24 @@ async fn upload_chunk(
             ..Default::default()
         };
 
-        let insertion = Chunk::insert(model)
-            .exec(&database)
-            .await
-            .map_err(ServerError::database_error)?;
+        let insertion = match Chunk::insert(model).exec(&database).await {
+            Ok(insertion) => {
+                tracing::debug!(
+                    database_operation = "pending_insert",
+                    database_ms = pending_insert_started.elapsed().as_millis(),
+                    "Chunk pending database insert completed"
+                );
+                insertion
+            }
+            Err(error) => {
+                tracing::warn!(
+                    database_operation = "pending_insert",
+                    database_outcome = "failed",
+                    "Chunk pending database insert failed"
+                );
+                return Err(ServerError::database_error(error));
+            }
+        };
 
         insertion.last_insert_id
     };
@@ -628,26 +792,34 @@ async fn upload_chunk(
         let key = key.clone();
 
         async move {
-            tracing::warn!("Error occurred - Cleaning up uploaded file and chunk entry");
+            tracing::info!(cleanup_outcome = "started", cleanup = "chunk", "Upload cleanup started");
 
             if let Err(e) = backend.delete_file(key).await {
-                tracing::warn!("Failed to clean up failed upload: {}", e);
+                tracing::warn!(cleanup_outcome = "failed", cleanup = "chunk_file", error = %e, "Upload cleanup failed");
             }
 
             if let Err(e) = Chunk::delete(chunk_model).exec(&database).await {
-                tracing::warn!("Failed to unregister failed chunk: {}", e);
+                tracing::warn!(cleanup_outcome = "failed", cleanup = "chunk", error = %e, "Upload cleanup failed");
+            } else {
+                tracing::info!(cleanup_outcome = "succeeded", cleanup = "chunk", "Upload cleanup completed");
             }
         }
+        .instrument(tracing::Span::current())
     });
 
     // Compress and stream to the storage backend
     let compressor = get_compressor_fn(compression_type, compression_level);
     let mut stream = CompressionStream::new(data.into_async_buf_read(), compressor);
 
+    let storage_started = Instant::now();
     backend
         .upload_file(key, stream.stream())
         .await
         .map_err(ServerError::storage_error)?;
+    tracing::debug!(
+        storage_ms = storage_started.elapsed().as_millis(),
+        "Chunk storage upload completed"
+    );
 
     // Confirm that the chunk hash is correct
     let (chunk_hash, chunk_size) = stream.nar_hash_and_size().unwrap();
@@ -664,7 +836,8 @@ async fn upload_chunk(
 
     // Update the file hash and size, and set the chunk to valid
     let file_size_db = i64::try_from(*file_size).map_err(ServerError::request_error)?;
-    let chunk = Chunk::update(chunk::ActiveModel {
+    let final_update_started = Instant::now();
+    let chunk = match Chunk::update(chunk::ActiveModel {
         id: Set(chunk_id),
         state: Set(ChunkState::Valid),
         file_hash: Set(Some(file_hash.to_typed_base16())),
@@ -674,11 +847,33 @@ async fn upload_chunk(
     })
     .exec(&database)
     .await
-    .map_err(ServerError::database_error)?;
+    {
+        Ok(chunk) => {
+            tracing::debug!(
+                database_operation = "final_valid_update",
+                database_ms = final_update_started.elapsed().as_millis(),
+                "Chunk final database update completed"
+            );
+            chunk
+        }
+        Err(error) => {
+            tracing::warn!(
+                database_operation = "final_valid_update",
+                database_outcome = "failed",
+                "Chunk final database update failed"
+            );
+            return Err(ServerError::database_error(error));
+        }
+    };
 
     cleanup.cancel();
 
     let guard = ChunkGuard::from_locked(database.clone(), chunk);
+
+    tracing::debug!(
+        chunk_total_ms = chunk_started.elapsed().as_millis(),
+        "Chunk lifecycle completed"
+    );
 
     Ok(UploadChunkResult {
         guard,
@@ -748,5 +943,53 @@ impl UploadPathNarInfoExt for UploadPathNarInfo {
             ca: Set(self.ca.clone()),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Instant;
+
+    use super::{UploadLifecycleGuard, UploadLifecycleOutcome};
+
+    fn guard(
+        events: Rc<RefCell<Vec<UploadLifecycleOutcome>>>,
+    ) -> UploadLifecycleGuard<impl FnMut(UploadLifecycleOutcome, u128)> {
+        UploadLifecycleGuard {
+            started: Instant::now(),
+            span: tracing::Span::none(),
+            emit: move |outcome, _| events.borrow_mut().push(outcome),
+            completed: false,
+        }
+    }
+
+    #[test]
+    fn lifecycle_guard_emits_one_success_or_error_event() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut success = guard(events.clone());
+        success.complete(UploadLifecycleOutcome::Success);
+        success.complete(UploadLifecycleOutcome::Error);
+        drop(success);
+
+        let mut error = guard(events.clone());
+        error.complete(UploadLifecycleOutcome::Error);
+        drop(error);
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                UploadLifecycleOutcome::Success,
+                UploadLifecycleOutcome::Error
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_guard_records_cancellation_on_drop() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        drop(guard(events.clone()));
+        assert_eq!(*events.borrow(), [UploadLifecycleOutcome::Cancelled]);
     }
 }

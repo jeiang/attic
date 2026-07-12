@@ -43,20 +43,20 @@ use sea_orm::{
     query::Statement,
 };
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 use access::http::{AuthState, apply_auth};
 use attic::cache::CacheName;
 use config::{Config, StorageConfig};
 use database::migration::{Migrator, MigratorTrait};
 use error::{ErrorKind, ServerError, ServerResult};
-use middleware::{init_request_state, restrict_host, set_visibility_header};
+use middleware::{assign_request_id, init_request_state, restrict_host, set_visibility_header};
 use storage::{LocalBackend, S3Backend, StorageBackendImpl};
 
 type State = Arc<StateInner>;
@@ -74,18 +74,14 @@ pub struct StateInner {
     /// Handle to the storage backend.
     storage: OnceCell<Arc<StorageBackendImpl>>,
 
-    /// Cached JSON Web Key Sets for OIDC providers.
-    oidc_keysets: Mutex<HashMap<String, CachedOidcKeyset>>,
-
-    /// Global semaphore bounding the number of concurrent `upload_path`
-    /// requests.
-    ///
-    /// `None` means unlimited (the default, preserving prior behavior).
+    /// Limits whole authenticated uploads across all requests when configured.
     upload_permits: Option<Arc<Semaphore>>,
 
-    /// Global semaphore bounding the number of chunks concurrently being
-    /// uploaded to the storage backend, across all requests.
+    /// Limits chunk uploads to storage across all requests.
     chunk_upload_permits: Arc<Semaphore>,
+
+    /// Cached JSON Web Key Sets for OIDC providers.
+    oidc_keysets: Mutex<HashMap<String, CachedOidcKeyset>>,
 }
 
 /// An OIDC JSON Web Key Set cached until its next refresh.
@@ -98,6 +94,9 @@ struct CachedOidcKeyset {
 /// Request state.
 #[derive(Debug)]
 struct RequestStateInner {
+    /// Request identifier returned to the client and included in request spans.
+    request_id: Uuid,
+
     /// Auth state.
     auth: AuthState,
 
@@ -120,6 +119,9 @@ struct RequestStateInner {
     public_cache: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestId(pub Uuid);
+
 impl StateInner {
     async fn new(config: Config) -> State {
         let upload_permits = config
@@ -131,9 +133,9 @@ impl StateInner {
             config,
             database: OnceCell::new(),
             storage: OnceCell::new(),
-            oidc_keysets: Mutex::new(HashMap::new()),
             upload_permits,
             chunk_upload_permits,
+            oidc_keysets: Mutex::new(HashMap::new()),
         })
     }
 
@@ -181,6 +183,20 @@ impl StateInner {
             .await
     }
 
+    /// Acquires the configured global upload permit, if enabled.
+    async fn acquire_upload_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.upload_permits {
+            Some(semaphore) => Some(
+                semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("upload semaphore is never closed"),
+            ),
+            None => None,
+        }
+    }
+
     /// Returns a handle to the storage backend.
     async fn storage(&self) -> ServerResult<&Arc<StorageBackendImpl>> {
         self.storage
@@ -197,24 +213,6 @@ impl StateInner {
                 }
             })
             .await
-    }
-
-    /// Acquires a permit against the global upload concurrency budget.
-    ///
-    /// Returns `None` if `max-concurrent-uploads` is unconfigured, meaning
-    /// there is no limit. The returned guard should be held for the
-    /// duration of the upload request.
-    async fn acquire_upload_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        match &self.upload_permits {
-            Some(semaphore) => Some(
-                semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("Upload semaphore should never be closed"),
-            ),
-            None => None,
-        }
     }
 
     /// Sends periodic heartbeat queries to the database.
@@ -306,7 +304,8 @@ pub async fn run_api_server(
         .layer(axum::middleware::from_fn(restrict_host))
         .layer(Extension(state.clone()))
         .layer(TraceLayer::new_for_http())
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::new())
+        .layer(axum::middleware::from_fn(assign_request_id));
 
     eprintln!("Listening on {:?}...", listen);
 

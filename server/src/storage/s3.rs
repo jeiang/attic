@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use aws_config::{BehaviorVersion, retry::RetryConfig};
 use aws_sdk_s3::{
     Client,
@@ -13,10 +14,11 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
 };
 use bytes::BytesMut;
-use futures::future::join_all;
+use futures::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 
 use super::{Download, RemoteFile, StorageBackend};
 use crate::error::{ErrorKind, ServerError, ServerResult};
@@ -26,25 +28,8 @@ use attic::util::Finally;
 /// The chunk size for each part in a multipart upload.
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-/// The size of the initial read used to decide between a single PutObject
-/// and a multipart upload.
-///
-/// Most `upload_file` calls carry a small CDC chunk (at most a few hundred
-/// KiB compressed), so eagerly allocating a full `CHUNK_SIZE` (8 MiB) buffer
-/// for every call wastes allocator headroom. We first read up to this
-/// smaller size; only if it fills up do we grow the buffer up to the full
-/// `CHUNK_SIZE` and proceed with the existing PutObject-vs-multipart
-/// decision (unchanged: PutObject iff the whole stream fits in one part).
+/// Avoid allocating a full multipart buffer for the common small-object case.
 const INITIAL_READ_SIZE: usize = 512 * 1024;
-
-/// Maximum number of multipart parts that may be buffered/in-flight
-/// (read from the stream but not yet fully uploaded) at once.
-///
-/// Without this bound, a fast reader races ahead of slower S3 uploads and
-/// the entire stream ends up buffered in memory as a backlog of pending
-/// parts. Permits are acquired before reading each part's data so the
-/// reader itself is throttled, not just the uploads.
-const MAX_CONCURRENT_MULTIPART_PARTS: usize = 4;
 
 /// The S3 remote file storage backend.
 #[derive(Debug)]
@@ -72,6 +57,13 @@ pub struct S3StorageConfig {
     /// If not specified, it's read from the `AWS_ACCESS_KEY_ID` and
     /// `AWS_SECRET_ACCESS_KEY` environment variables.
     credentials: Option<S3CredentialsConfig>,
+
+    /// Maximum number of multipart part uploads in flight.
+    #[serde(
+        rename = "multipart-concurrency",
+        default = "default_multipart_concurrency"
+    )]
+    multipart_concurrency: usize,
 }
 
 /// S3 credential configuration.
@@ -186,6 +178,20 @@ impl S3Backend {
     }
 }
 
+impl S3StorageConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.multipart_concurrency > 0,
+            "storage.multipart-concurrency must be greater than zero"
+        );
+        Ok(())
+    }
+}
+
+fn default_multipart_concurrency() -> usize {
+    4
+}
+
 impl StorageBackend for S3Backend {
     async fn upload_file(
         &self,
@@ -198,15 +204,10 @@ impl StorageBackend for S3Backend {
             .map_err(ServerError::storage_error)?;
 
         let first_chunk = if small_chunk.len() < INITIAL_READ_SIZE {
-            // The whole stream fit in the small initial buffer.
             small_chunk
         } else {
-            // The initial buffer filled up - grow to the full part size and
-            // keep reading to determine whether we need multipart upload.
             let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
             buf.extend_from_slice(&small_chunk);
-            drop(small_chunk);
-
             read_chunk_async(&mut stream, buf)
                 .await
                 .map_err(ServerError::storage_error)?
@@ -251,7 +252,7 @@ impl StorageBackend for S3Backend {
             let name = name.clone();
 
             async move {
-                tracing::warn!("Upload was interrupted - Aborting multipart upload");
+                tracing::info!(multipart_outcome = "abort-started", "Multipart abort started");
 
                 let r = client
                     .abort_multipart_upload()
@@ -262,29 +263,32 @@ impl StorageBackend for S3Backend {
                     .await;
 
                 if let Err(e) = r {
-                    tracing::warn!("Failed to abort multipart upload: {}", e);
+                    tracing::warn!(multipart_outcome = "abort-failed", error = %e, "Multipart abort failed");
+                } else {
+                    tracing::info!(multipart_outcome = "aborted", "Multipart abort completed");
                 }
             }
+            .instrument(tracing::Span::current())
         });
 
-        let part_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MULTIPART_PARTS));
-
         let mut part_number = 1;
-        let mut parts = Vec::new();
+        let part_limit = Arc::new(Semaphore::new(self.config.multipart_concurrency));
+        let mut parts = FuturesUnordered::new();
+        let mut completed_parts = Vec::new();
         let mut first_chunk = Some(first_chunk);
 
         loop {
-            // Acquire a permit before reading the next part's data (or,
-            // for the already-read first chunk, before spawning its
-            // upload). This bounds how many parts may be buffered/
-            // in-flight at once - acquiring the permit after the read
-            // would still let the reader race ahead and buffer the
-            // whole stream.
-            let permit = part_semaphore
+            // Do not read another part until there is space for it. The body
+            // held by each future is the only multipart read-ahead buffer.
+            if parts.len() == self.config.multipart_concurrency {
+                completed_parts.push(parts.next().await.expect("part queue is non-empty")?);
+            }
+
+            let permit = part_limit
                 .clone()
                 .acquire_owned()
                 .await
-                .expect("part semaphore should never be closed");
+                .expect("multipart semaphore is never closed");
 
             let chunk = if part_number == 1 {
                 first_chunk.take().unwrap()
@@ -303,8 +307,9 @@ impl StorageBackend for S3Backend {
             let bucket = self.config.bucket.clone();
             let key = name.clone();
             let upload_id = upload_id.to_owned();
-            let fut = tokio::task::spawn(async move {
-                let result = client
+            parts.push(async move {
+                let _permit = permit;
+                let part = client
                     .upload_part()
                     .bucket(bucket)
                     .key(key)
@@ -312,32 +317,28 @@ impl StorageBackend for S3Backend {
                     .part_number(part_number)
                     .body(chunk.into())
                     .send()
-                    .await;
+                    .await
+                    .map_err(ServerError::storage_error)?;
 
-                // Release the permit only once the upload has finished,
-                // regardless of outcome.
-                drop(permit);
-
-                result
+                Ok::<CompletedPart, ServerError>(
+                    CompletedPart::builder()
+                        .set_e_tag(part.e_tag().map(str::to_string))
+                        .set_part_number(Some(part_number))
+                        .build(),
+                )
             });
 
-            parts.push(fut);
             part_number += 1;
         }
 
-        let uploaded_parts = join_all(parts).await;
-        let mut completed_parts = Vec::with_capacity(uploaded_parts.len());
-
-        for (idx, join_result) in uploaded_parts.into_iter().enumerate() {
-            let part = join_result.unwrap().map_err(ServerError::storage_error)?;
-            let part_number = idx + 1;
-            completed_parts.push(
-                CompletedPart::builder()
-                    .set_e_tag(part.e_tag().map(str::to_string))
-                    .set_part_number(Some(part_number as i32))
-                    .build(),
-            );
+        // `parts` is request-owned. On an error, dropping it cancels every
+        // remaining request before `cleanup` aborts the multipart upload.
+        while let Some(part) = parts.next().await {
+            completed_parts.push(part?);
         }
+        completed_parts.sort_by_key(|part| part.part_number().unwrap_or_default());
+        let part_count = completed_parts.len();
+        tracing::debug!(multipart_outcome = "parts-uploaded", part_count);
 
         let completed_multipart_upload = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
@@ -355,6 +356,7 @@ impl StorageBackend for S3Backend {
             .map_err(ServerError::storage_error)?;
 
         tracing::debug!("complete_multipart_upload -> {:#?}", completion);
+        tracing::info!(multipart_outcome = "completed", part_count);
 
         cleanup.cancel();
 
@@ -414,5 +416,33 @@ impl StorageBackend for S3Backend {
             bucket: self.config.bucket.clone(),
             key: name,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::S3StorageConfig;
+
+    #[test]
+    fn multipart_concurrency_defaults_and_rejects_zero() {
+        let config: S3StorageConfig = toml::from_str(
+            r#"
+                region = "test-region"
+                bucket = "test-bucket"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.multipart_concurrency, 4);
+        assert!(config.validate().is_ok());
+
+        let zero: S3StorageConfig = toml::from_str(
+            r#"
+                region = "test-region"
+                bucket = "test-bucket"
+                multipart-concurrency = 0
+            "#,
+        )
+        .unwrap();
+        assert!(zero.validate().is_err());
     }
 }

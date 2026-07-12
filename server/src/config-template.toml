@@ -117,6 +117,10 @@ path = "%storage_path%"
 # Set this if you are using an S3-compatible object storage (e.g., Minio).
 #endpoint = "https://xxx.r2.cloudflarestorage.com"
 
+# Maximum in-flight S3 multipart parts. This also bounds how many part bodies
+# are read ahead from an incoming upload.
+#multipart-concurrency = 4
+
 # Credentials
 #
 # If unset, the credentials are read from the `AWS_ACCESS_KEY_ID` and

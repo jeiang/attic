@@ -110,22 +110,13 @@ pub struct Config {
     #[serde(default = "default_max_nar_info_size")]
     pub max_nar_info_size: usize,
 
-    /// The maximum number of `upload_path` requests that may be in flight
-    /// at once, server-wide.
-    ///
-    /// If unset (default), there is no limit, preserving the existing
-    /// behavior. In memory-constrained deployments, set this to a value
-    /// sized for your pod's memory limit to bound peak memory usage during
-    /// concurrent NAR uploads.
+    /// Maximum concurrent authenticated uploads. If unset, uploads are not
+    /// globally limited.
     #[serde(rename = "max-concurrent-uploads")]
     #[serde(default)]
     pub max_concurrent_uploads: Option<usize>,
 
-    /// The maximum number of chunks that may be uploaded to the storage
-    /// backend concurrently, server-wide.
-    ///
-    /// This is a global limit shared across all in-flight uploads, not a
-    /// per-request limit.
+    /// Maximum chunks uploaded to storage concurrently across all requests.
     #[serde(rename = "max-concurrent-chunk-uploads")]
     #[serde(default = "default_max_concurrent_chunk_uploads")]
     pub max_concurrent_chunk_uploads: usize,
@@ -382,36 +373,21 @@ pub struct DatabaseConfig {
     pub heartbeat: bool,
 
     /// The SQLite `mmap_size` pragma, in bytes.
-    ///
-    /// This only applies when the database URL points to SQLite. Larger
-    /// values can improve read performance for large databases, at the
-    /// cost of page-cache/RSS accounting under cgroup memory limits.
-    ///
-    /// Defaults to 512 MiB.
     #[serde(rename = "mmap-size")]
     #[serde(default = "default_db_mmap_size")]
     pub mmap_size: u64,
 
-    /// The maximum number of connections in the database connection pool.
-    ///
-    /// If unset, the default is 10 for PostgreSQL; for SQLite, sea-orm
-    /// defaults to a single connection.
+    /// Maximum connections in the database pool.
     #[serde(rename = "max-connections")]
     #[serde(default)]
     pub max_connections: Option<u32>,
 
-    /// The minimum number of connections kept open in the database
-    /// connection pool.
-    ///
-    /// If unset, the sqlx default (0) is used.
+    /// Minimum connections retained in the database pool.
     #[serde(rename = "min-connections")]
     #[serde(default)]
     pub min_connections: Option<u32>,
 
-    /// How long a connection may remain idle in the pool before being
-    /// closed.
-    ///
-    /// If unset, the sqlx default is used.
+    /// Maximum connection idle time.
     #[serde(rename = "idle-timeout")]
     #[serde(with = "humantime_serde::option")]
     #[serde(default)]
@@ -748,10 +724,6 @@ fn default_db_heartbeat() -> bool {
     false
 }
 
-fn default_db_mmap_size() -> u64 {
-    512 * 1024 * 1024 // 512 MiB
-}
-
 fn default_soft_delete_caches() -> bool {
     false
 }
@@ -776,6 +748,10 @@ fn default_max_concurrent_chunk_uploads() -> usize {
     10
 }
 
+fn default_db_mmap_size() -> u64 {
+    512 * 1024 * 1024
+}
+
 fn default_oidc_scopes() -> Vec<String> {
     vec!["openid".to_string()]
 }
@@ -789,42 +765,53 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
 
     let config = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&config)?;
-    validate_concurrency_config(&config)?;
-    validate_oidc_config(&config)?;
-    validate_database_config(&config)?;
+    validate_config(&config)?;
     Ok(config)
 }
 
 fn load_config_from_str(s: &str) -> Result<Config> {
     tracing::info!("Using configurations from environment variable");
     let config: Config = toml::from_str(s)?;
-    validate_concurrency_config(&config)?;
-    validate_oidc_config(&config)?;
-    validate_database_config(&config)?;
+    validate_config(&config)?;
     Ok(config)
 }
 
+fn validate_config(config: &Config) -> Result<()> {
+    validate_concurrency_config(config)?;
+    if let StorageConfig::S3(s3) = &config.storage {
+        s3.validate()?;
+    }
+    validate_oidc_config(config)?;
+    validate_database_config(config)
+}
+
 fn validate_concurrency_config(config: &Config) -> Result<()> {
+    validate_concurrency_values(
+        config.max_concurrent_uploads,
+        config.max_concurrent_chunk_uploads,
+    )
+}
+
+fn validate_concurrency_values(
+    max_concurrent_uploads: Option<usize>,
+    max_concurrent_chunk_uploads: usize,
+) -> Result<()> {
     anyhow::ensure!(
-        config.max_concurrent_uploads != Some(0),
-        "max-concurrent-uploads must be greater than zero \
-        (unset the option to allow unlimited concurrent uploads)"
+        max_concurrent_uploads != Some(0),
+        "max-concurrent-uploads must be greater than zero (unset it to disable the limit)"
     );
     anyhow::ensure!(
-        config.max_concurrent_chunk_uploads != 0,
+        max_concurrent_chunk_uploads > 0,
         "max-concurrent-chunk-uploads must be greater than zero"
     );
-
     Ok(())
 }
 
 fn validate_database_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.database.max_connections != Some(0),
-        "database.max-connections must be greater than zero \
-        (unset the option to use the default pool size)"
+        "database.max-connections must be greater than zero (unset it to use the default pool size)"
     );
-
     if let (Some(min), Some(max)) = (
         config.database.min_connections,
         config.database.max_connections,
@@ -834,7 +821,6 @@ fn validate_database_config(config: &Config) -> Result<()> {
             "database.min-connections ({min}) must not exceed database.max-connections ({max})"
         );
     }
-
     Ok(())
 }
 
@@ -891,7 +877,7 @@ fn validate_oidc_config(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod oidc_tests {
-    use super::OidcClaimValue;
+    use super::{OidcClaimValue, validate_concurrency_values};
     use serde_json::json;
 
     #[test]
@@ -901,6 +887,13 @@ mod oidc_tests {
         assert!(OidcClaimValue::Bool(true).matches(&json!(true)));
         assert!(OidcClaimValue::Integer(42).matches(&json!([7, 42])));
         assert!(!OidcClaimValue::String("admins".to_owned()).matches(&json!("users")));
+    }
+
+    #[test]
+    fn upload_limits_default_and_reject_zero() {
+        assert!(validate_concurrency_values(None, 10).is_ok());
+        assert!(validate_concurrency_values(Some(0), 10).is_err());
+        assert!(validate_concurrency_values(None, 0).is_err());
     }
 }
 

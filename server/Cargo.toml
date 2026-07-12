@@ -103,5 +103,8 @@ features = [
   "sync",
 ]
 
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.7.0"
