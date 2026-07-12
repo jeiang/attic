@@ -22,6 +22,19 @@ allowed-hosts = []
 # The maximum size of the upload info JSON, in bytes.
 #max-nar-info-size = 1048576 # 1 MiB
 
+# The maximum number of `upload_path` requests that may be in flight at
+# once, server-wide.
+#
+# If unset (default), there is no limit. In memory-constrained deployments,
+# set this to a value sized for your pod's memory limit to bound peak
+# memory usage during concurrent NAR uploads (e.g., 2-4 for a 256-512 MiB
+# pod). Must be greater than zero if set.
+#max-concurrent-uploads = 4
+
+# The maximum number of chunks that may be uploaded to the storage backend
+# concurrently, server-wide (not per-request). Must be greater than zero.
+#max-concurrent-chunk-uploads = 10
+
 # Whether to soft-delete caches
 #
 # If this is enabled, caches are soft-deleted instead of actually
@@ -48,6 +61,36 @@ url = "%database_url%"
 #
 # If enabled, a heartbeat query will be sent every minute
 #heartbeat = false
+
+# The SQLite `mmap_size` pragma, in bytes
+#
+# This only applies when the database URL points to SQLite (it's ignored
+# for PostgreSQL). Larger values can improve read performance for large
+# databases, at the cost of inflating page-cache/RSS accounting under
+# cgroup memory limits. Defaults to 512 MiB. Previously this was
+# hardcoded to ~30 GB.
+#mmap-size = 536870912
+
+# The maximum number of connections in the database connection pool
+#
+# If unset, the default is 10 for PostgreSQL; for SQLite, sea-orm
+# defaults to a single connection. Lowering this saves memory on
+# constrained deployments at the cost of more contention under load.
+#max-connections = 10
+
+# The minimum number of connections kept open in the database connection
+# pool
+#
+# If unset, the sqlx default (0) is used. Must not exceed the effective
+# maximum pool size (including the implicit defaults above); this is
+# only validated when max-connections is set explicitly.
+#min-connections = 0
+
+# How long a connection may remain idle in the pool before being closed
+#
+# If unset, the sqlx default is used (idle connections are not proactively
+# closed).
+#idle-timeout = "10m"
 
 # File storage configuration
 [storage]

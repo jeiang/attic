@@ -110,6 +110,26 @@ pub struct Config {
     #[serde(default = "default_max_nar_info_size")]
     pub max_nar_info_size: usize,
 
+    /// The maximum number of `upload_path` requests that may be in flight
+    /// at once, server-wide.
+    ///
+    /// If unset (default), there is no limit, preserving the existing
+    /// behavior. In memory-constrained deployments, set this to a value
+    /// sized for your pod's memory limit to bound peak memory usage during
+    /// concurrent NAR uploads.
+    #[serde(rename = "max-concurrent-uploads")]
+    #[serde(default)]
+    pub max_concurrent_uploads: Option<usize>,
+
+    /// The maximum number of chunks that may be uploaded to the storage
+    /// backend concurrently, server-wide.
+    ///
+    /// This is a global limit shared across all in-flight uploads, not a
+    /// per-request limit.
+    #[serde(rename = "max-concurrent-chunk-uploads")]
+    #[serde(default = "default_max_concurrent_chunk_uploads")]
+    pub max_concurrent_chunk_uploads: usize,
+
     /// Database connection.
     pub database: DatabaseConfig,
 
@@ -360,6 +380,42 @@ pub struct DatabaseConfig {
     /// If enabled, a heartbeat query will be sent every minute.
     #[serde(default = "default_db_heartbeat")]
     pub heartbeat: bool,
+
+    /// The SQLite `mmap_size` pragma, in bytes.
+    ///
+    /// This only applies when the database URL points to SQLite. Larger
+    /// values can improve read performance for large databases, at the
+    /// cost of page-cache/RSS accounting under cgroup memory limits.
+    ///
+    /// Defaults to 512 MiB.
+    #[serde(rename = "mmap-size")]
+    #[serde(default = "default_db_mmap_size")]
+    pub mmap_size: u64,
+
+    /// The maximum number of connections in the database connection pool.
+    ///
+    /// If unset, the default is 10 for PostgreSQL; for SQLite, sea-orm
+    /// defaults to a single connection.
+    #[serde(rename = "max-connections")]
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+
+    /// The minimum number of connections kept open in the database
+    /// connection pool.
+    ///
+    /// If unset, the sqlx default (0) is used.
+    #[serde(rename = "min-connections")]
+    #[serde(default)]
+    pub min_connections: Option<u32>,
+
+    /// How long a connection may remain idle in the pool before being
+    /// closed.
+    ///
+    /// If unset, the sqlx default is used.
+    #[serde(rename = "idle-timeout")]
+    #[serde(with = "humantime_serde::option")]
+    #[serde(default)]
+    pub idle_timeout: Option<Duration>,
 }
 
 /// File storage configuration.
@@ -692,6 +748,10 @@ fn default_db_heartbeat() -> bool {
     false
 }
 
+fn default_db_mmap_size() -> u64 {
+    512 * 1024 * 1024 // 512 MiB
+}
+
 fn default_soft_delete_caches() -> bool {
     false
 }
@@ -712,6 +772,10 @@ fn default_max_nar_info_size() -> usize {
     1024 * 1024 // 1 MiB
 }
 
+fn default_max_concurrent_chunk_uploads() -> usize {
+    10
+}
+
 fn default_oidc_scopes() -> Vec<String> {
     vec!["openid".to_string()]
 }
@@ -725,15 +789,53 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
 
     let config = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&config)?;
+    validate_concurrency_config(&config)?;
     validate_oidc_config(&config)?;
+    validate_database_config(&config)?;
     Ok(config)
 }
 
 fn load_config_from_str(s: &str) -> Result<Config> {
     tracing::info!("Using configurations from environment variable");
     let config: Config = toml::from_str(s)?;
+    validate_concurrency_config(&config)?;
     validate_oidc_config(&config)?;
+    validate_database_config(&config)?;
     Ok(config)
+}
+
+fn validate_concurrency_config(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        config.max_concurrent_uploads != Some(0),
+        "max-concurrent-uploads must be greater than zero \
+        (unset the option to allow unlimited concurrent uploads)"
+    );
+    anyhow::ensure!(
+        config.max_concurrent_chunk_uploads != 0,
+        "max-concurrent-chunk-uploads must be greater than zero"
+    );
+
+    Ok(())
+}
+
+fn validate_database_config(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        config.database.max_connections != Some(0),
+        "database.max-connections must be greater than zero \
+        (unset the option to use the default pool size)"
+    );
+
+    if let (Some(min), Some(max)) = (
+        config.database.min_connections,
+        config.database.max_connections,
+    ) {
+        anyhow::ensure!(
+            min <= max,
+            "database.min-connections ({min}) must not exceed database.max-connections ({max})"
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_oidc_config(config: &Config) -> Result<()> {

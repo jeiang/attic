@@ -178,8 +178,13 @@ async fn run_reap_orphan_chunks(state: &State) -> Result<()> {
     let orphan_chunk_limit = match database_backend {
         // Arbitrarily chosen sensible value since there's no good default to choose from for MySQL
         sea_orm::DatabaseBackend::MySql => 1000,
-        // Panic limit set by sqlx for postgresql: https://github.com/launchbadge/sqlx/issues/671#issuecomment-687043510
-        sea_orm::DatabaseBackend::Postgres => u64::from(u16::MAX),
+        // sqlx's bind-parameter cap for postgresql allows up to u16::MAX
+        // (https://github.com/launchbadge/sqlx/issues/671#issuecomment-687043510), but we
+        // deliberately cap the per-batch fetch at 1000 here too: fetching the whole backlog in
+        // one `Vec` (up to 65,535 full `chunk::Model` rows, including `remote_file` JSON) can
+        // spike memory in-process with the API server. The loop below drains any larger backlog
+        // in bounded sub-batches instead.
+        sea_orm::DatabaseBackend::Postgres => 1000,
         // Default statement limit imposed by sqlite: https://www.sqlite.org/limits.html#max_variable_number
         sea_orm::DatabaseBackend::Sqlite => 500,
         _ => {
@@ -219,57 +224,80 @@ async fn run_reap_orphan_chunks(state: &State) -> Result<()> {
 
     db.execute_raw(transition_statement).await?;
 
-    let orphan_chunks: Vec<chunk::Model> = Chunk::find()
-        .filter(chunk::Column::State.eq(ChunkState::Deleted))
-        .limit(orphan_chunk_limit)
-        .all(db)
-        .await?;
+    // Drain the Deleted-state backlog in sub-batches of at most `orphan_chunk_limit` rows
+    // instead of one giant fetch, so peak memory (and the storage-deletion semaphore below)
+    // stays bounded even when there are far more than `orphan_chunk_limit` orphan chunks.
+    //
+    // Termination: the loop stops when a fetch returns fewer than a full batch (the backlog
+    // is exhausted), OR when a full batch makes zero progress (every deletion in it failed).
+    // The latter guards against spinning forever: chunks whose storage deletion fails are left
+    // in `Deleted` state (see comment below) and would otherwise be refetched by `.filter(State
+    // == Deleted)` on every iteration without ever being cleared out.
+    let mut total_deleted = 0u64;
+    loop {
+        let orphan_chunks: Vec<chunk::Model> = Chunk::find()
+            .filter(chunk::Column::State.eq(ChunkState::Deleted))
+            .limit(orphan_chunk_limit)
+            .all(db)
+            .await?;
 
-    if orphan_chunks.is_empty() {
-        return Ok(());
+        if orphan_chunks.is_empty() {
+            break;
+        }
+
+        let batch_len = orphan_chunks.len() as u64;
+
+        // Delete the chunks from remote storage
+        let delete_limit = Arc::new(Semaphore::new(20)); // TODO: Make this configurable
+        let futures: Vec<_> = orphan_chunks
+            .into_iter()
+            .map(|chunk| {
+                let delete_limit = delete_limit.clone();
+                async move {
+                    let permit = delete_limit.acquire().await?;
+                    storage.delete_file_db(&chunk.remote_file.0).await?;
+                    drop(permit);
+                    Result::<_, anyhow::Error>::Ok(chunk.id)
+                }
+            })
+            .collect();
+
+        // Deletions can result in spurious failures, tolerate them
+        //
+        // Chunks that failed to be deleted from the remote storage will
+        // just be stuck in Deleted state.
+        //
+        // TODO: Maybe have an interactive command to retry deletions?
+        let deleted_chunk_ids: Vec<_> = join_all(futures)
+            .await
+            .into_iter()
+            .filter(|r| {
+                if let Err(e) = r {
+                    tracing::warn!("Deletion failed: {}", e);
+                }
+
+                r.is_ok()
+            })
+            .map(|r| r.unwrap())
+            .collect();
+
+        let made_progress = !deleted_chunk_ids.is_empty();
+
+        if made_progress {
+            // Finally, delete them from the database
+            let deletion = Chunk::delete_many()
+                .filter(chunk::Column::Id.is_in(deleted_chunk_ids))
+                .exec(db)
+                .await?;
+            total_deleted += deletion.rows_affected;
+        }
+
+        if batch_len < orphan_chunk_limit || !made_progress {
+            break;
+        }
     }
 
-    // Delete the chunks from remote storage
-    let delete_limit = Arc::new(Semaphore::new(20)); // TODO: Make this configurable
-    let futures: Vec<_> = orphan_chunks
-        .into_iter()
-        .map(|chunk| {
-            let delete_limit = delete_limit.clone();
-            async move {
-                let permit = delete_limit.acquire().await?;
-                storage.delete_file_db(&chunk.remote_file.0).await?;
-                drop(permit);
-                Result::<_, anyhow::Error>::Ok(chunk.id)
-            }
-        })
-        .collect();
-
-    // Deletions can result in spurious failures, tolerate them
-    //
-    // Chunks that failed to be deleted from the remote storage will
-    // just be stuck in Deleted state.
-    //
-    // TODO: Maybe have an interactive command to retry deletions?
-    let deleted_chunk_ids: Vec<_> = join_all(futures)
-        .await
-        .into_iter()
-        .filter(|r| {
-            if let Err(e) = r {
-                tracing::warn!("Deletion failed: {}", e);
-            }
-
-            r.is_ok()
-        })
-        .map(|r| r.unwrap())
-        .collect();
-
-    // Finally, delete them from the database
-    let deletion = Chunk::delete_many()
-        .filter(chunk::Column::Id.is_in(deleted_chunk_ids))
-        .exec(db)
-        .await?;
-
-    tracing::info!("Deleted {} orphan chunks", deletion.rows_affected);
+    tracing::info!("Deleted {} orphan chunks", total_deleted);
 
     Ok(())
 }

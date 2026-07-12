@@ -39,11 +39,13 @@ use axum::{
     http::{Uri, uri::Scheme},
 };
 use sea_orm::{
-    ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType, query::Statement,
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType,
+    query::Statement,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
+use tokio::sync::Semaphore;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -74,6 +76,16 @@ pub struct StateInner {
 
     /// Cached JSON Web Key Sets for OIDC providers.
     oidc_keysets: Mutex<HashMap<String, CachedOidcKeyset>>,
+
+    /// Global semaphore bounding the number of concurrent `upload_path`
+    /// requests.
+    ///
+    /// `None` means unlimited (the default, preserving prior behavior).
+    upload_permits: Option<Arc<Semaphore>>,
+
+    /// Global semaphore bounding the number of chunks concurrently being
+    /// uploaded to the storage backend, across all requests.
+    chunk_upload_permits: Arc<Semaphore>,
 }
 
 /// An OIDC JSON Web Key Set cached until its next refresh.
@@ -110,11 +122,18 @@ struct RequestStateInner {
 
 impl StateInner {
     async fn new(config: Config) -> State {
+        let upload_permits = config
+            .max_concurrent_uploads
+            .map(|n| Arc::new(Semaphore::new(n)));
+        let chunk_upload_permits = Arc::new(Semaphore::new(config.max_concurrent_chunk_uploads));
+
         Arc::new(Self {
             config,
             database: OnceCell::new(),
             storage: OnceCell::new(),
             oidc_keysets: Mutex::new(HashMap::new()),
+            upload_permits,
+            chunk_upload_permits,
         })
     }
 
@@ -122,7 +141,18 @@ impl StateInner {
     async fn database(&self) -> ServerResult<&DatabaseConnection> {
         self.database
             .get_or_try_init(|| async {
-                let db = Database::connect(&self.config.database.url)
+                let mut connect_options = ConnectOptions::new(self.config.database.url.clone());
+                if let Some(max_connections) = self.config.database.max_connections {
+                    connect_options.max_connections(max_connections);
+                }
+                if let Some(min_connections) = self.config.database.min_connections {
+                    connect_options.min_connections(min_connections);
+                }
+                if let Some(idle_timeout) = self.config.database.idle_timeout {
+                    connect_options.idle_timeout(idle_timeout);
+                }
+
+                let db = Database::connect(connect_options)
                     .await
                     .map_err(ServerError::database_error);
                 if let Ok(db_conn) = &db
@@ -133,15 +163,16 @@ impl StateInner {
                     // more details
                     // intentionally ignore errors from this: this is purely for performance,
                     // not for correctness, so we can live without this
+                    let mmap_size = self.config.database.mmap_size;
                     _ = conn
-                        .execute_unprepared(
+                        .execute_unprepared(&format!(
                             "
                         pragma journal_mode=WAL;
                         pragma synchronous=normal;
                         pragma temp_store=memory;
-                        pragma mmap_size = 30000000000;
-                        ",
-                        )
+                        pragma mmap_size = {mmap_size};
+                        "
+                        ))
                         .await;
                 }
 
@@ -166,6 +197,24 @@ impl StateInner {
                 }
             })
             .await
+    }
+
+    /// Acquires a permit against the global upload concurrency budget.
+    ///
+    /// Returns `None` if `max-concurrent-uploads` is unconfigured, meaning
+    /// there is no limit. The returned guard should be held for the
+    /// duration of the upload request.
+    async fn acquire_upload_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.upload_permits {
+            Some(semaphore) => Some(
+                semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("Upload semaphore should never be closed"),
+            ),
+            None => None,
+        }
     }
 
     /// Sends periodic heartbeat queries to the database.
