@@ -104,6 +104,9 @@ in
             copyToRoot = [
               self'.packages.attic-server
 
+              # Required by SSL_CERT_FILE below.
+              pkgs.cacert
+
               # Debugging utilities for `fly ssh console`
               pkgs.busybox
 
@@ -112,6 +115,9 @@ in
             ];
             config = {
               Entrypoint = [ "/bin/atticd" ];
+              ExposedPorts = {
+                "8080/tcp" = {};
+              };
               Env = [
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               ];

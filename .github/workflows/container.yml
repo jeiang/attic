@@ -1,0 +1,85 @@
+name: Container image
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Build and validate container images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+        continue-on-error: true # Self-hosted runners already have Nix installed
+
+      - name: Cache dev shell
+        run: .ci/cache-shell.sh
+
+      - name: Build and inspect container images
+        shell: bash
+        run: |
+          amd64_image="$(nix build --no-link --print-out-paths -L .#attic-server-image)"
+          arm64_image="$(nix build --no-link --print-out-paths -L .#attic-server-image-aarch64)"
+
+          .ci/run skopeo inspect "docker-archive:$amd64_image" | \
+            .ci/run jq -e '.Os == "linux" and .Architecture == "amd64"'
+          .ci/run skopeo inspect "docker-archive:$arm64_image" | \
+            .ci/run jq -e '.Os == "linux" and .Architecture == "arm64"'
+
+          docker load <"$amd64_image"
+          docker run --rm attic-server:main --version
+
+  publish:
+    name: Publish container image
+    if: github.event_name == 'push'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+        continue-on-error: true # Self-hosted runners already have Nix installed
+
+      - name: Cache dev shell
+        run: .ci/cache-shell.sh
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-architecture image
+        shell: bash
+        run: |
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tags=("$GITHUB_SHA")
+
+          if [[ "$GITHUB_REF_TYPE" == "branch" ]]; then
+            tags+=("latest")
+          else
+            version="${GITHUB_REF_NAME#v}"
+            if [[ -z "$version" ]]; then
+              echo "Version tags must include a value after the v prefix." >&2
+              exit 1
+            fi
+            tags+=("$version")
+          fi
+
+          .ci/run just ci-build-and-push-images "$image_name" "${tags[@]}"
