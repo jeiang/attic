@@ -558,16 +558,22 @@ pub async fn upload_path(
         );
     let bar = mp.add(ProgressBar::new(path_info.nar_size));
     bar.set_style(style);
-    let nar_stream = NarStreamProgress::new(store.nar_from_path(path.to_owned()), bar.clone())
-        .map_ok(Bytes::from);
+    let request = api.prepare_upload_path(upload_info, force_preamble)?;
 
     let start = Instant::now();
     match api
-        .upload_path(upload_info, nar_stream, force_preamble)
+        .upload_path_with_retry(|attempt| {
+            bar.set_position(0);
+            tracing::debug!(attempt, "Starting path upload attempt");
+            let nar_stream =
+                NarStreamProgress::new(store.nar_from_path(path.to_owned()), bar.clone())
+                    .map_ok(Bytes::from);
+            api.upload_path_attempt(&request, nar_stream)
+        })
         .await
     {
-        Ok(r) => {
-            let r = r.unwrap_or(UploadPathResult {
+        Ok(upload) => {
+            let r = upload.value.unwrap_or(UploadPathResult {
                 kind: UploadPathResultKind::Uploaded,
                 file_size: None,
                 frac_deduplicated: None,

@@ -443,6 +443,7 @@ dependencies = [
  "displaydoc",
  "enum-as-inner",
  "futures",
+ "httpdate",
  "humantime",
  "indicatif",
  "lazy_static",
