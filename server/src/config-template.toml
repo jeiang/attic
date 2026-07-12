@@ -71,6 +71,24 @@ url = "%database_url%"
 # hardcoded to ~30 GB.
 #mmap-size = 536870912
 
+# The maximum number of connections in the database connection pool
+#
+# If unset, the sqlx default (10) is used. Lowering this saves memory
+# on constrained deployments at the cost of more contention under load.
+#max-connections = 10
+
+# The minimum number of connections kept open in the database connection
+# pool
+#
+# If unset, the sqlx default (0) is used. Must not exceed max-connections.
+#min-connections = 0
+
+# How long a connection may remain idle in the pool before being closed
+#
+# If unset, the sqlx default is used (idle connections are not proactively
+# closed).
+#idle-timeout = "10m"
+
 # File storage configuration
 [storage]
 # Storage type

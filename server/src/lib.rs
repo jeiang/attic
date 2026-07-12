@@ -39,7 +39,8 @@ use axum::{
     http::{Uri, uri::Scheme},
 };
 use sea_orm::{
-    ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType, query::Statement,
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType,
+    query::Statement,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -140,7 +141,18 @@ impl StateInner {
     async fn database(&self) -> ServerResult<&DatabaseConnection> {
         self.database
             .get_or_try_init(|| async {
-                let db = Database::connect(&self.config.database.url)
+                let mut connect_options = ConnectOptions::new(self.config.database.url.clone());
+                if let Some(max_connections) = self.config.database.max_connections {
+                    connect_options.max_connections(max_connections);
+                }
+                if let Some(min_connections) = self.config.database.min_connections {
+                    connect_options.min_connections(min_connections);
+                }
+                if let Some(idle_timeout) = self.config.database.idle_timeout {
+                    connect_options.idle_timeout(idle_timeout);
+                }
+
+                let db = Database::connect(connect_options)
                     .await
                     .map_err(ServerError::database_error);
                 if let Ok(db_conn) = &db

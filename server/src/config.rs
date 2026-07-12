@@ -391,6 +391,30 @@ pub struct DatabaseConfig {
     #[serde(rename = "mmap-size")]
     #[serde(default = "default_db_mmap_size")]
     pub mmap_size: u64,
+
+    /// The maximum number of connections in the database connection pool.
+    ///
+    /// If unset, the sqlx default (10) is used.
+    #[serde(rename = "max-connections")]
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+
+    /// The minimum number of connections kept open in the database
+    /// connection pool.
+    ///
+    /// If unset, the sqlx default (0) is used.
+    #[serde(rename = "min-connections")]
+    #[serde(default)]
+    pub min_connections: Option<u32>,
+
+    /// How long a connection may remain idle in the pool before being
+    /// closed.
+    ///
+    /// If unset, the sqlx default is used.
+    #[serde(rename = "idle-timeout")]
+    #[serde(with = "humantime_serde::option")]
+    #[serde(default)]
+    pub idle_timeout: Option<Duration>,
 }
 
 /// File storage configuration.
@@ -766,6 +790,7 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
     let config: Config = toml::from_str(&config)?;
     validate_concurrency_config(&config)?;
     validate_oidc_config(&config)?;
+    validate_database_config(&config)?;
     Ok(config)
 }
 
@@ -774,6 +799,7 @@ fn load_config_from_str(s: &str) -> Result<Config> {
     let config: Config = toml::from_str(s)?;
     validate_concurrency_config(&config)?;
     validate_oidc_config(&config)?;
+    validate_database_config(&config)?;
     Ok(config)
 }
 
@@ -787,6 +813,26 @@ fn validate_concurrency_config(config: &Config) -> Result<()> {
         config.max_concurrent_chunk_uploads != 0,
         "max-concurrent-chunk-uploads must be greater than zero"
     );
+
+    Ok(())
+}
+
+fn validate_database_config(config: &Config) -> Result<()> {
+    anyhow::ensure!(
+        config.database.max_connections != Some(0),
+        "database.max-connections must be greater than zero \
+        (unset the option to use the default pool size)"
+    );
+
+    if let (Some(min), Some(max)) = (
+        config.database.min_connections,
+        config.database.max_connections,
+    ) {
+        anyhow::ensure!(
+            min <= max,
+            "database.min-connections ({min}) must not exceed database.max-connections ({max})"
+        );
+    }
 
     Ok(())
 }
