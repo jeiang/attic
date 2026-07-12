@@ -15,6 +15,7 @@ let
       "cache configure"
       "cache destroy"
       "cache info"
+      "cache list"
     ];
     atticd = [
       null
