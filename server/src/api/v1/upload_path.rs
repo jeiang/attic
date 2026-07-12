@@ -678,20 +678,36 @@ async fn upload_chunk(
     state: State,
     require_proof_of_possession: bool,
 ) -> ServerResult<UploadChunkResult> {
-    let database_started = Instant::now();
+    let chunk_started = Instant::now();
     let compression: Compression = compression_type.into();
 
     let given_chunk_hash = data.hash();
     let given_chunk_size = data.size();
 
-    if let Some(existing_chunk) = database
+    let lookup_started = Instant::now();
+    let existing_chunk = match database
         .find_and_lock_chunk(&given_chunk_hash, compression)
-        .await?
+        .await
     {
-        tracing::debug!(
-            database_ms = database_started.elapsed().as_millis(),
-            "Chunk database lookup completed"
-        );
+        Ok(chunk) => {
+            tracing::debug!(
+                database_operation = "lookup",
+                database_ms = lookup_started.elapsed().as_millis(),
+                "Chunk database lookup completed"
+            );
+            chunk
+        }
+        Err(error) => {
+            tracing::warn!(
+                database_operation = "lookup",
+                database_outcome = "failed",
+                "Chunk database lookup failed"
+            );
+            return Err(error);
+        }
+    };
+
+    if let Some(existing_chunk) = existing_chunk {
         // There's an existing chunk matching the hash
         if require_proof_of_possession && !data.is_hash_trusted() {
             let stream = data.into_async_buf_read();
@@ -714,6 +730,10 @@ async fn upload_chunk(
             }
         }
 
+        tracing::debug!(
+            chunk_total_ms = chunk_started.elapsed().as_millis(),
+            "Chunk lifecycle completed"
+        );
         return Ok(UploadChunkResult {
             guard: existing_chunk,
             deduplicated: true,
@@ -728,6 +748,7 @@ async fn upload_chunk(
 
     let chunk_size_db = i64::try_from(given_chunk_size).map_err(ServerError::request_error)?;
 
+    let pending_insert_started = Instant::now();
     let chunk_id = {
         let model = chunk::ActiveModel {
             state: Set(ChunkState::PendingUpload),
@@ -744,10 +765,24 @@ async fn upload_chunk(
             ..Default::default()
         };
 
-        let insertion = Chunk::insert(model)
-            .exec(&database)
-            .await
-            .map_err(ServerError::database_error)?;
+        let insertion = match Chunk::insert(model).exec(&database).await {
+            Ok(insertion) => {
+                tracing::debug!(
+                    database_operation = "pending_insert",
+                    database_ms = pending_insert_started.elapsed().as_millis(),
+                    "Chunk pending database insert completed"
+                );
+                insertion
+            }
+            Err(error) => {
+                tracing::warn!(
+                    database_operation = "pending_insert",
+                    database_outcome = "failed",
+                    "Chunk pending database insert failed"
+                );
+                return Err(ServerError::database_error(error));
+            }
+        };
 
         insertion.last_insert_id
     };
@@ -806,7 +841,8 @@ async fn upload_chunk(
 
     // Update the file hash and size, and set the chunk to valid
     let file_size_db = i64::try_from(*file_size).map_err(ServerError::request_error)?;
-    let chunk = Chunk::update(chunk::ActiveModel {
+    let final_update_started = Instant::now();
+    let chunk = match Chunk::update(chunk::ActiveModel {
         id: Set(chunk_id),
         state: Set(ChunkState::Valid),
         file_hash: Set(Some(file_hash.to_typed_base16())),
@@ -816,15 +852,33 @@ async fn upload_chunk(
     })
     .exec(&database)
     .await
-    .map_err(ServerError::database_error)?;
-    tracing::debug!(
-        database_ms = database_started.elapsed().as_millis(),
-        "Chunk database lifecycle completed"
-    );
+    {
+        Ok(chunk) => {
+            tracing::debug!(
+                database_operation = "final_valid_update",
+                database_ms = final_update_started.elapsed().as_millis(),
+                "Chunk final database update completed"
+            );
+            chunk
+        }
+        Err(error) => {
+            tracing::warn!(
+                database_operation = "final_valid_update",
+                database_outcome = "failed",
+                "Chunk final database update failed"
+            );
+            return Err(ServerError::database_error(error));
+        }
+    };
 
     cleanup.cancel();
 
     let guard = ChunkGuard::from_locked(database.clone(), chunk);
+
+    tracing::debug!(
+        chunk_total_ms = chunk_started.elapsed().as_millis(),
+        "Chunk lifecycle completed"
+    );
 
     Ok(UploadChunkResult {
         guard,
