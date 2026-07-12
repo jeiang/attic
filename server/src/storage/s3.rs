@@ -16,6 +16,7 @@ use bytes::BytesMut;
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
+use tracing::Instrument;
 
 use super::{Download, RemoteFile, StorageBackend};
 use crate::error::{ErrorKind, ServerError, ServerResult};
@@ -236,7 +237,7 @@ impl StorageBackend for S3Backend {
             let name = name.clone();
 
             async move {
-                tracing::warn!("Upload was interrupted - Aborting multipart upload");
+                tracing::info!(multipart_outcome = "abort-started", "Multipart abort started");
 
                 let r = client
                     .abort_multipart_upload()
@@ -247,9 +248,12 @@ impl StorageBackend for S3Backend {
                     .await;
 
                 if let Err(e) = r {
-                    tracing::warn!("Failed to abort multipart upload: {}", e);
+                    tracing::warn!(multipart_outcome = "abort-failed", error = %e, "Multipart abort failed");
+                } else {
+                    tracing::info!(multipart_outcome = "aborted", "Multipart abort completed");
                 }
             }
+            .instrument(tracing::Span::current())
         });
 
         let mut part_number = 1;

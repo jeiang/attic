@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncReadExt};
 use tokio::sync::Semaphore;
 use tokio_util::io::StreamReader;
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 use uuid::Uuid;
 
 use crate::compression::{CompressionStream, CompressorFn};
@@ -74,6 +74,60 @@ trait UploadPathNarInfoExt {
     fn to_active_model(&self) -> object::ActiveModel;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UploadLifecycleOutcome {
+    Success,
+    Error,
+    Cancelled,
+}
+
+struct UploadLifecycleGuard<F: FnMut(UploadLifecycleOutcome, u128)> {
+    started: Instant,
+    span: tracing::Span,
+    emit: F,
+    completed: bool,
+}
+
+impl UploadLifecycleGuard<fn(UploadLifecycleOutcome, u128)> {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            span: tracing::Span::current(),
+            emit: emit_upload_lifecycle,
+            completed: false,
+        }
+    }
+}
+
+impl<F: FnMut(UploadLifecycleOutcome, u128)> UploadLifecycleGuard<F> {
+    fn complete(&mut self, outcome: UploadLifecycleOutcome) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let elapsed_ms = self.started.elapsed().as_millis();
+        self.span.in_scope(|| (self.emit)(outcome, elapsed_ms));
+    }
+}
+
+impl<F: FnMut(UploadLifecycleOutcome, u128)> Drop for UploadLifecycleGuard<F> {
+    fn drop(&mut self) {
+        self.complete(UploadLifecycleOutcome::Cancelled);
+    }
+}
+
+fn emit_upload_lifecycle(outcome: UploadLifecycleOutcome, elapsed_ms: u128) {
+    tracing::info!(
+        status = match outcome {
+            UploadLifecycleOutcome::Success => "success",
+            UploadLifecycleOutcome::Error => "error",
+            UploadLifecycleOutcome::Cancelled => "cancelled",
+        },
+        elapsed_ms,
+        "Upload lifecycle completed"
+    );
+}
+
 /// Uploads a new object to the cache.
 ///
 /// When clients request to upload an object, we first try to increment
@@ -98,7 +152,22 @@ pub(crate) async fn upload_path(
     headers: HeaderMap,
     body: Body,
 ) -> ServerResult<Json<UploadPathResult>> {
-    let request_started = Instant::now();
+    let mut lifecycle = UploadLifecycleGuard::new();
+    let result = upload_path_inner(state, req_state, headers, body).await;
+    lifecycle.complete(if result.is_ok() {
+        UploadLifecycleOutcome::Success
+    } else {
+        UploadLifecycleOutcome::Error
+    });
+    result
+}
+
+async fn upload_path_inner(
+    state: State,
+    req_state: RequestState,
+    headers: HeaderMap,
+    body: Body,
+) -> ServerResult<Json<UploadPathResult>> {
     let stream = body.into_data_stream();
     let mut stream =
         StreamReader::new(stream.map(|r| r.map_err(|e| io::Error::other(e.to_string()))));
@@ -191,7 +260,7 @@ pub(crate) async fn upload_path(
 
         if missing_chunk.is_none() {
             // Can actually be deduplicated
-            let result = upload_path_dedup(
+            return upload_path_dedup(
                 username,
                 cache,
                 upload_info,
@@ -201,22 +270,10 @@ pub(crate) async fn upload_path(
                 existing_nar,
             )
             .await;
-            span.record("status", if result.is_ok() { "success" } else { "error" });
-            tracing::info!(
-                elapsed_ms = request_started.elapsed().as_millis(),
-                "Upload lifecycle completed"
-            );
-            return result;
         }
     }
 
-    let result = upload_path_new(username, cache, upload_info, stream, database, &state).await;
-    span.record("status", if result.is_ok() { "success" } else { "error" });
-    tracing::info!(
-        elapsed_ms = request_started.elapsed().as_millis(),
-        "Upload lifecycle completed"
-    );
-    result
+    upload_path_new(username, cache, upload_info, stream, database, &state).await
 }
 
 /// Uploads a path when there is already a matching NAR in the global cache.
@@ -344,12 +401,15 @@ async fn upload_path_new_chunked(
         };
 
         async move {
-            tracing::warn!("Error occurred - Cleaning up NAR entry");
+            tracing::info!(cleanup_outcome = "started", cleanup = "nar", "Upload cleanup started");
 
             if let Err(e) = Nar::delete(nar_model).exec(&database).await {
-                tracing::warn!("Failed to unregister failed NAR: {}", e);
+                tracing::warn!(cleanup_outcome = "failed", cleanup = "nar", error = %e, "Upload cleanup failed");
+            } else {
+                tracing::info!(cleanup_outcome = "succeeded", cleanup = "nar", "Upload cleanup completed");
             }
         }
+        .instrument(tracing::Span::current())
     });
 
     let stream = stream.take(upload_info.nar_size as u64);
@@ -702,16 +762,19 @@ async fn upload_chunk(
         let key = key.clone();
 
         async move {
-            tracing::warn!("Error occurred - Cleaning up uploaded file and chunk entry");
+            tracing::info!(cleanup_outcome = "started", cleanup = "chunk", "Upload cleanup started");
 
             if let Err(e) = backend.delete_file(key).await {
-                tracing::warn!("Failed to clean up failed upload: {}", e);
+                tracing::warn!(cleanup_outcome = "failed", cleanup = "chunk_file", error = %e, "Upload cleanup failed");
             }
 
             if let Err(e) = Chunk::delete(chunk_model).exec(&database).await {
-                tracing::warn!("Failed to unregister failed chunk: {}", e);
+                tracing::warn!(cleanup_outcome = "failed", cleanup = "chunk", error = %e, "Upload cleanup failed");
+            } else {
+                tracing::info!(cleanup_outcome = "succeeded", cleanup = "chunk", "Upload cleanup completed");
             }
         }
+        .instrument(tracing::Span::current())
     });
 
     // Compress and stream to the storage backend
@@ -831,5 +894,53 @@ impl UploadPathNarInfoExt for UploadPathNarInfo {
             ca: Set(self.ca.clone()),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Instant;
+
+    use super::{UploadLifecycleGuard, UploadLifecycleOutcome};
+
+    fn guard(
+        events: Rc<RefCell<Vec<UploadLifecycleOutcome>>>,
+    ) -> UploadLifecycleGuard<impl FnMut(UploadLifecycleOutcome, u128)> {
+        UploadLifecycleGuard {
+            started: Instant::now(),
+            span: tracing::Span::none(),
+            emit: move |outcome, _| events.borrow_mut().push(outcome),
+            completed: false,
+        }
+    }
+
+    #[test]
+    fn lifecycle_guard_emits_one_success_or_error_event() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut success = guard(events.clone());
+        success.complete(UploadLifecycleOutcome::Success);
+        success.complete(UploadLifecycleOutcome::Error);
+        drop(success);
+
+        let mut error = guard(events.clone());
+        error.complete(UploadLifecycleOutcome::Error);
+        drop(error);
+
+        assert_eq!(
+            *events.borrow(),
+            [
+                UploadLifecycleOutcome::Success,
+                UploadLifecycleOutcome::Error
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_guard_records_cancellation_on_drop() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        drop(guard(events.clone()));
+        assert_eq!(*events.borrow(), [UploadLifecycleOutcome::Cancelled]);
     }
 }
