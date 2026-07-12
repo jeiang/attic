@@ -7,6 +7,7 @@
     - [Deploying to NixOS](./admin-guide/deployment/nixos.md)
     - [OIDC Authentication](./admin-guide/oidc.md)
     - [Chunking](./admin-guide/chunking.md)
+    - [Upload Reliability](./admin-guide/upload-reliability.md)
 - [FAQs](./faqs.md)
 - [Reference](./reference/README.md)
     - [attic](./reference/attic-cli.md)

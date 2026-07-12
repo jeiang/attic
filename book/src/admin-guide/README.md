@@ -7,3 +7,4 @@ For a quick start, read the [Tutorial](../tutorial.md).
 
 - **[Deploying to NixOS](./deployment/nixos.md)** - Deploying to a NixOS machine
 - **[Chunking](./chunking.md)** - Configuring Content-Defined Chunking data deduplication in Attic
+- **[Upload Reliability](./upload-reliability.md)** - Diagnosing interrupted uploads and tuning concurrency
