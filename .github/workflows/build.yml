@@ -2,9 +2,6 @@ name: Build
 on:
   pull_request:
   push:
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
 jobs:
   build:
     strategy:
@@ -223,92 +220,4 @@ jobs:
             xargs attic push "ci:$ATTIC_CACHE"
           else
             cat
-          fi
-
-  image:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    needs:
-      - build
-      - tests
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7.0.0
-
-      - name: Install current Bash on macOS
-        if: runner.os == 'macOS'
-        run: |
-          command -v brew && brew install bash || true
-
-      - uses: DeterminateSystems/nix-installer-action@v22
-        continue-on-error: true # Self-hosted runners already have Nix installed
-
-      - name: Install Attic
-        run: |
-          if ! command -v attic &> /dev/null; then
-            ./.github/install-attic-ci.sh
-          fi
-
-      - name: Configure Attic
-        continue-on-error: true
-        run: |
-          : "${ATTIC_SERVER:=https://staging.attic.rs/}"
-          : "${ATTIC_CACHE:=attic-ci}"
-          export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          attic login --set-default ci "$ATTIC_SERVER" "$ATTIC_TOKEN"
-          attic use "$ATTIC_CACHE"
-          if [ -n "$ATTIC_TOKEN" ]; then
-            echo ATTIC_CACHE=$ATTIC_CACHE >>$GITHUB_ENV
-          fi
-        env:
-          ATTIC_SERVER: ${{ secrets.ATTIC_SERVER }}
-          ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
-          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
-
-      - name: Cache dev shell
-        run: |
-          .ci/cache-shell.sh
-          system=$(nix-instantiate --eval -E 'builtins.currentSystem')
-          echo system=$system >>$GITHUB_ENV
-
-      - name: Log in to the Container registry
-        uses: docker/login-action@v4.2.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push container images
-        continue-on-error: true
-        run: |
-          declare -a tags
-          tags+=("${{ github.sha }}")
-
-          branch=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-          if [[ "${{ github.ref }}" == "refs/tags/"* ]]; then
-            tags+=("$(echo $branch | sed -e 's/^v//')")
-          else
-            tags+=("${branch}")
-          fi
-
-          if [ "$branch" == "${{ github.event.repository.default_branch }}" ]; then
-            tags+=("latest")
-          fi
-
-          >&2 echo "Image: ${IMAGE_NAME}"
-          >&2 echo "Tags: ${tags[@]}"
-
-          .ci/run just ci-build-and-push-images "${IMAGE_NAME}" "${tags[@]}"
-
-      # TODO: Just take a diff of the list of store paths, also abstract all of this out
-      - name: Push build artifacts
-        run: |
-          export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          if [ -n "$ATTIC_CACHE" ]; then
-            nix build --no-link --print-out-paths -L \
-              .#attic-server-image \
-              .#attic-server-image-aarch64 \
-            | xargs attic push "ci:$ATTIC_CACHE"
           fi
