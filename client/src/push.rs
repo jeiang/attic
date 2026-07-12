@@ -614,7 +614,7 @@ pub async fn upload_path(
                 eprintln!("❌ {}: {}", path.as_os_str().to_string_lossy(), e);
             });
             bar.finish_and_clear();
-            Err(e)
+            Err(e.into())
         }
     }
 }

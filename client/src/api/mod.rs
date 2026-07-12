@@ -6,12 +6,11 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use const_format::formatcp;
-use displaydoc::Display;
 use futures::{
     future,
     stream::{self, StreamExt, TryStream, TryStreamExt},
 };
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{
     Body, Client as HttpClient, Response, StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT},
