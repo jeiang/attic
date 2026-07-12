@@ -1,7 +1,6 @@
 name: Container image
 
 on:
-  pull_request:
   push:
     branches:
       - main
@@ -13,38 +12,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate:
-    name: Build and validate container images
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7.0.0
-
-      - uses: DeterminateSystems/nix-installer-action@v22
-        continue-on-error: true # Self-hosted runners already have Nix installed
-
-      - name: Cache dev shell
-        run: .ci/cache-shell.sh
-
-      - name: Build and inspect container images
-        shell: bash
-        run: |
-          amd64_image="$(nix build --no-link --print-out-paths -L .#attic-server-image)"
-          arm64_image="$(nix build --no-link --print-out-paths -L .#attic-server-image-aarch64)"
-
-          .ci/run skopeo inspect "docker-archive:$amd64_image" | \
-            .ci/run jq -e '.Os == "linux" and .Architecture == "amd64"'
-          .ci/run skopeo inspect "docker-archive:$arm64_image" | \
-            .ci/run jq -e '.Os == "linux" and .Architecture == "arm64"'
-
-          docker load <"$amd64_image"
-          docker run --rm attic-server:main --version
-
-  publish:
-    name: Publish container image
-    if: github.event_name == 'push'
-    needs: validate
+  container:
+    name: Build, validate, and publish container images
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -58,7 +27,26 @@ jobs:
       - name: Cache dev shell
         run: .ci/cache-shell.sh
 
+      - id: images
+        name: Build container images
+        shell: bash
+        run: |
+          echo "amd64=$(nix build --no-link --print-out-paths -L .#attic-server-image)" >>"$GITHUB_OUTPUT"
+          echo "arm64=$(nix build --no-link --print-out-paths -L .#attic-server-image-aarch64)" >>"$GITHUB_OUTPUT"
+
+      - name: Inspect container images
+        shell: bash
+        run: |
+          .ci/run skopeo inspect "docker-archive:${{ steps.images.outputs.amd64 }}" | \
+            .ci/run jq -e '.Os == "linux" and .Architecture == "amd64"'
+          .ci/run skopeo inspect "docker-archive:${{ steps.images.outputs.arm64 }}" | \
+            .ci/run jq -e '.Os == "linux" and .Architecture == "arm64"'
+
+          docker load <"${{ steps.images.outputs.amd64 }}"
+          docker run --rm attic-server:main --version
+
       - name: Log in to the Container registry
+        if: github.event_name == 'push'
         uses: docker/login-action@v4.2.0
         with:
           registry: ghcr.io
@@ -66,7 +54,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push multi-architecture image
+        if: github.event_name == 'push'
         shell: bash
+        env:
+          ATTIC_IMAGE_AMD64: ${{ steps.images.outputs.amd64 }}
+          ATTIC_IMAGE_ARM64: ${{ steps.images.outputs.arm64 }}
         run: |
           image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
           tags=("$GITHUB_SHA")
