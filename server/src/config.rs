@@ -394,7 +394,8 @@ pub struct DatabaseConfig {
 
     /// The maximum number of connections in the database connection pool.
     ///
-    /// If unset, the sqlx default (10) is used.
+    /// If unset, the default is 10 for PostgreSQL; for SQLite, sea-orm
+    /// defaults to a single connection.
     #[serde(rename = "max-connections")]
     #[serde(default)]
     pub max_connections: Option<u32>,

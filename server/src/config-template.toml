@@ -73,14 +73,17 @@ url = "%database_url%"
 
 # The maximum number of connections in the database connection pool
 #
-# If unset, the sqlx default (10) is used. Lowering this saves memory
-# on constrained deployments at the cost of more contention under load.
+# If unset, the default is 10 for PostgreSQL; for SQLite, sea-orm
+# defaults to a single connection. Lowering this saves memory on
+# constrained deployments at the cost of more contention under load.
 #max-connections = 10
 
 # The minimum number of connections kept open in the database connection
 # pool
 #
-# If unset, the sqlx default (0) is used. Must not exceed max-connections.
+# If unset, the sqlx default (0) is used. Must not exceed the effective
+# maximum pool size (including the implicit defaults above); this is
+# only validated when max-connections is set explicitly.
 #min-connections = 0
 
 # How long a connection may remain idle in the pool before being closed
