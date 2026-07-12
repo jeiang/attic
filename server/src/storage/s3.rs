@@ -1,5 +1,6 @@
 //! S3 remote files.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_config::{BehaviorVersion, retry::RetryConfig};
@@ -15,6 +16,7 @@ use bytes::BytesMut;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
+use tokio::sync::Semaphore;
 
 use super::{Download, RemoteFile, StorageBackend};
 use crate::error::{ErrorKind, ServerError, ServerResult};
@@ -23,6 +25,26 @@ use attic::util::Finally;
 
 /// The chunk size for each part in a multipart upload.
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// The size of the initial read used to decide between a single PutObject
+/// and a multipart upload.
+///
+/// Most `upload_file` calls carry a small CDC chunk (at most a few hundred
+/// KiB compressed), so eagerly allocating a full `CHUNK_SIZE` (8 MiB) buffer
+/// for every call wastes allocator headroom. We first read up to this
+/// smaller size; only if it fills up do we grow the buffer up to the full
+/// `CHUNK_SIZE` and proceed with the existing PutObject-vs-multipart
+/// decision (unchanged: PutObject iff the whole stream fits in one part).
+const INITIAL_READ_SIZE: usize = 512 * 1024;
+
+/// Maximum number of multipart parts that may be buffered/in-flight
+/// (read from the stream but not yet fully uploaded) at once.
+///
+/// Without this bound, a fast reader races ahead of slower S3 uploads and
+/// the entire stream ends up buffered in memory as a backlog of pending
+/// parts. Permits are acquired before reading each part's data so the
+/// reader itself is throttled, not just the uploads.
+const MAX_CONCURRENT_MULTIPART_PARTS: usize = 4;
 
 /// The S3 remote file storage backend.
 #[derive(Debug)]
@@ -170,10 +192,25 @@ impl StorageBackend for S3Backend {
         name: String,
         mut stream: &mut (dyn AsyncRead + Unpin + Send),
     ) -> ServerResult<RemoteFile> {
-        let buf = BytesMut::with_capacity(CHUNK_SIZE);
-        let first_chunk = read_chunk_async(&mut stream, buf)
+        let buf = BytesMut::with_capacity(INITIAL_READ_SIZE);
+        let small_chunk = read_chunk_async(&mut stream, buf)
             .await
             .map_err(ServerError::storage_error)?;
+
+        let first_chunk = if small_chunk.len() < INITIAL_READ_SIZE {
+            // The whole stream fit in the small initial buffer.
+            small_chunk
+        } else {
+            // The initial buffer filled up - grow to the full part size and
+            // keep reading to determine whether we need multipart upload.
+            let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
+            buf.extend_from_slice(&small_chunk);
+            drop(small_chunk);
+
+            read_chunk_async(&mut stream, buf)
+                .await
+                .map_err(ServerError::storage_error)?
+        };
 
         if first_chunk.len() < CHUNK_SIZE {
             // do a normal PutObject
@@ -230,11 +267,25 @@ impl StorageBackend for S3Backend {
             }
         });
 
+        let part_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_MULTIPART_PARTS));
+
         let mut part_number = 1;
         let mut parts = Vec::new();
         let mut first_chunk = Some(first_chunk);
 
         loop {
+            // Acquire a permit before reading the next part's data (or,
+            // for the already-read first chunk, before spawning its
+            // upload). This bounds how many parts may be buffered/
+            // in-flight at once - acquiring the permit after the read
+            // would still let the reader race ahead and buffer the
+            // whole stream.
+            let permit = part_semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("part semaphore should never be closed");
+
             let chunk = if part_number == 1 {
                 first_chunk.take().unwrap()
             } else {
@@ -249,15 +300,25 @@ impl StorageBackend for S3Backend {
             }
 
             let client = self.client.clone();
-            let fut = tokio::task::spawn({
-                client
+            let bucket = self.config.bucket.clone();
+            let key = name.clone();
+            let upload_id = upload_id.to_owned();
+            let fut = tokio::task::spawn(async move {
+                let result = client
                     .upload_part()
-                    .bucket(&self.config.bucket)
-                    .key(&name)
+                    .bucket(bucket)
+                    .key(key)
                     .upload_id(upload_id)
                     .part_number(part_number)
-                    .body(chunk.clone().into())
+                    .body(chunk.into())
                     .send()
+                    .await;
+
+                // Release the permit only once the upload has finished,
+                // regardless of outcome.
+                drop(permit);
+
+                result
             });
 
             parts.push(fut);
