@@ -20,6 +20,7 @@ mod command;
 mod config;
 mod nix_config;
 mod nix_netrc;
+mod oidc;
 mod push;
 mod version;
 

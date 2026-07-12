@@ -26,10 +26,11 @@ pub mod nix_manifest;
 pub mod oobe;
 mod storage;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::{
@@ -41,6 +42,7 @@ use sea_orm::{
     ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType, query::Statement,
 };
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -69,6 +71,16 @@ pub struct StateInner {
 
     /// Handle to the storage backend.
     storage: OnceCell<Arc<StorageBackendImpl>>,
+
+    /// Cached JSON Web Key Sets for OIDC providers.
+    oidc_keysets: Mutex<HashMap<String, CachedOidcKeyset>>,
+}
+
+/// An OIDC JSON Web Key Set cached until its next refresh.
+#[derive(Debug)]
+struct CachedOidcKeyset {
+    refresh_at: Instant,
+    keys: Vec<serde_json::Value>,
 }
 
 /// Request state.
@@ -102,6 +114,7 @@ impl StateInner {
             config,
             database: OnceCell::new(),
             storage: OnceCell::new(),
+            oidc_keysets: Mutex::new(HashMap::new()),
         })
     }
 

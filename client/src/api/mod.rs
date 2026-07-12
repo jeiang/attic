@@ -13,7 +13,7 @@ use reqwest::{
     Body, Client as HttpClient, Response, StatusCode, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ServerConfig;
 use crate::version::ATTIC_DISTRIBUTOR;
@@ -60,7 +60,73 @@ pub struct StructuredApiError {
     message: String,
 }
 
+/// A server-advertised OIDC login provider.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcProvider {
+    pub name: String,
+    pub display_name: String,
+    pub mode: OidcProviderMode,
+    pub issuer: String,
+    pub audience: String,
+    pub authorization_endpoint: Option<String>,
+    pub token_endpoint: Option<String>,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OidcProviderMode {
+    AuthorizationCodePkce,
+    GithubActions,
+}
+
+#[derive(Deserialize)]
+struct OidcProvidersResponse {
+    providers: Vec<OidcProvider>,
+}
+
+#[derive(Serialize)]
+struct OidcExchangeRequest<'a> {
+    provider: &'a str,
+    id_token: &'a str,
+}
+
+#[derive(Deserialize)]
+struct OidcExchangeResponse {
+    access_token: String,
+}
+
 impl ApiClient {
+    /// Fetches the OIDC providers configured by an Attic server.
+    pub async fn oidc_providers(endpoint: &str) -> Result<Vec<OidcProvider>> {
+        let endpoint = Url::parse(endpoint)?.join("_api/v1/auth/oidc/providers")?;
+        let response = build_http_client(None).get(endpoint).send().await?;
+        if response.status().is_success() {
+            Ok(response.json::<OidcProvidersResponse>().await?.providers)
+        } else {
+            Err(ApiError::try_from_response(response).await?.into())
+        }
+    }
+
+    /// Exchanges a provider ID token for a short-lived Attic token.
+    pub async fn exchange_oidc_token(
+        endpoint: &str,
+        provider: &str,
+        id_token: &str,
+    ) -> Result<String> {
+        let endpoint = Url::parse(endpoint)?.join("_api/v1/auth/oidc/exchange")?;
+        let response = build_http_client(None)
+            .post(endpoint)
+            .json(&OidcExchangeRequest { provider, id_token })
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(response.json::<OidcExchangeResponse>().await?.access_token)
+        } else {
+            Err(ApiError::try_from_response(response).await?.into())
+        }
+    }
+
     pub fn from_server_config(config: ServerConfig) -> Result<Self> {
         let client = build_http_client(config.token()?.as_deref());
 

@@ -1,6 +1,6 @@
 //! Server configuration.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -8,13 +8,16 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_compression::Level as CompressionLevel;
+use attic::cache::CacheNamePattern;
 use attic_token::SignatureType;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use serde::{Deserialize, de};
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize, de};
+use serde_json::Value as JsonValue;
 use xdg::BaseDirectories;
 
 use crate::access::{
-    HS256Key, RS256KeyPair, RS256PublicKey, decode_token_hs256_secret_base64,
+    CachePermission, HS256Key, RS256KeyPair, RS256PublicKey, decode_token_hs256_secret_base64,
     decode_token_rs256_pubkey_base64, decode_token_rs256_secret_base64,
 };
 use crate::narinfo::Compression as NixCompression;
@@ -129,6 +132,10 @@ pub struct Config {
     #[serde(default = "Default::default")]
     pub jwt: JWTConfig,
 
+    /// OpenID Connect identity providers used to mint short-lived Attic tokens.
+    #[serde(default = "Default::default")]
+    pub oidc: OidcConfig,
+
     /// (Deprecated Stub)
     ///
     /// This simply results in an error telling the user to update
@@ -164,6 +171,145 @@ pub struct JWTConfig {
     #[serde(default = "load_jwt_signing_config_from_env")]
     #[debug(skip)]
     pub signing_config: JWTSigningConfig,
+}
+
+/// OpenID Connect configuration.
+#[derive(Clone, Default, Deserialize, derive_more::Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OidcConfig {
+    /// Trusted identity providers.
+    #[serde(default)]
+    pub providers: Vec<OidcProviderConfig>,
+}
+
+/// A trusted OIDC identity provider.
+#[derive(Clone, Deserialize, derive_more::Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OidcProviderConfig {
+    /// Name selected by `attic login --oidc`.
+    pub name: String,
+
+    /// How the CLI obtains an ID token.
+    pub mode: OidcProviderMode,
+
+    /// Expected `iss` claim.
+    pub issuer: String,
+
+    /// Expected `aud` claim. This is the Pocket ID client ID for PKCE providers.
+    pub audience: String,
+
+    /// URL of the provider's JSON Web Key Set.
+    #[serde(rename = "jwks-url")]
+    pub jwks_url: String,
+
+    /// Human-readable display name returned to the CLI.
+    #[serde(rename = "display-name")]
+    pub display_name: Option<String>,
+
+    /// Authorization endpoint for PKCE logins.
+    #[serde(rename = "authorization-endpoint")]
+    pub authorization_endpoint: Option<String>,
+
+    /// Token endpoint for PKCE logins.
+    #[serde(rename = "token-endpoint")]
+    pub token_endpoint: Option<String>,
+
+    /// OAuth scopes requested by PKCE logins.
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+
+    /// Validity of an Attic token minted through this provider.
+    #[serde(
+        rename = "token-validity",
+        default = "default_oidc_token_validity",
+        with = "humantime_serde"
+    )]
+    pub token_validity: Duration,
+
+    /// Rules mapping verified provider claims to Attic permissions.
+    #[serde(default)]
+    pub rules: Vec<OidcRuleConfig>,
+}
+
+/// OIDC login mode.
+#[derive(Clone, Copy, Deserialize, Serialize, derive_more::Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OidcProviderMode {
+    /// Browser authorization-code flow using PKCE.
+    AuthorizationCodePkce,
+    /// GitHub Actions workload identity token.
+    GithubActions,
+}
+
+/// A claim-to-permission authorization rule.
+#[derive(Clone, Deserialize, derive_more::Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OidcRuleConfig {
+    /// Required claims. All configured entries must match.
+    pub claims: BTreeMap<String, OidcClaimValue>,
+
+    /// Attic permissions to grant for matching identities.
+    pub caches: IndexMap<CacheNamePattern, CachePermission>,
+}
+
+/// A scalar OIDC claim value.
+#[derive(Clone, Deserialize, derive_more::Debug, PartialEq)]
+#[serde(untagged)]
+pub enum OidcClaimValue {
+    String(String),
+    Integer(i64),
+    Bool(bool),
+}
+
+impl OidcProviderConfig {
+    /// Returns the permissions granted by all matching authorization rules.
+    pub fn permissions_for_claims(
+        &self,
+        claims: &JsonValue,
+    ) -> IndexMap<CacheNamePattern, CachePermission> {
+        let mut grants = IndexMap::new();
+        let Some(claims) = claims.as_object() else {
+            return grants;
+        };
+
+        for rule in &self.rules {
+            if !rule.claims.iter().all(|(name, expected)| {
+                claims
+                    .get(name)
+                    .is_some_and(|actual| expected.matches(actual))
+            }) {
+                continue;
+            }
+
+            for (cache, permission) in &rule.caches {
+                let merged = grants.entry(cache.clone()).or_default();
+                merged.pull |= permission.pull;
+                merged.push |= permission.push;
+                merged.delete |= permission.delete;
+                merged.create_cache |= permission.create_cache;
+                merged.configure_cache |= permission.configure_cache;
+                merged.configure_cache_retention |= permission.configure_cache_retention;
+                merged.destroy_cache |= permission.destroy_cache;
+            }
+        }
+
+        grants
+    }
+}
+
+impl OidcClaimValue {
+    fn matches(&self, actual: &JsonValue) -> bool {
+        let scalar_matches = |value: &JsonValue| match self {
+            Self::String(expected) => value.as_str().is_some_and(|v| v == expected),
+            Self::Integer(expected) => value.as_i64().is_some_and(|v| v == *expected),
+            Self::Bool(expected) => value.as_bool().is_some_and(|v| v == *expected),
+        };
+
+        scalar_matches(actual)
+            || actual
+                .as_array()
+                .is_some_and(|values| values.iter().any(scalar_matches))
+    }
 }
 
 /// JSON Web Token signing configuration.
@@ -566,16 +712,94 @@ fn default_max_nar_info_size() -> usize {
     1024 * 1024 // 1 MiB
 }
 
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".to_string()]
+}
+
+fn default_oidc_token_validity() -> Duration {
+    Duration::from_secs(12 * 60 * 60)
+}
+
 fn load_config_from_path(path: &Path) -> Result<Config> {
     tracing::info!("Using configurations: {:?}", path);
 
     let config = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&config)?)
+    let config: Config = toml::from_str(&config)?;
+    validate_oidc_config(&config)?;
+    Ok(config)
 }
 
 fn load_config_from_str(s: &str) -> Result<Config> {
     tracing::info!("Using configurations from environment variable");
-    Ok(toml::from_str(s)?)
+    let config: Config = toml::from_str(s)?;
+    validate_oidc_config(&config)?;
+    Ok(config)
+}
+
+fn validate_oidc_config(config: &Config) -> Result<()> {
+    let mut names = HashSet::new();
+    for provider in &config.oidc.providers {
+        anyhow::ensure!(
+            !provider.name.trim().is_empty(),
+            "OIDC provider names cannot be empty"
+        );
+        anyhow::ensure!(
+            names.insert(provider.name.as_str()),
+            "OIDC provider name {:?} is configured more than once",
+            provider.name
+        );
+        anyhow::ensure!(
+            !provider.rules.is_empty(),
+            "OIDC provider {:?} must have at least one authorization rule",
+            provider.name
+        );
+        anyhow::ensure!(
+            provider.token_validity > Duration::ZERO,
+            "OIDC provider {:?} token-validity must be greater than zero",
+            provider.name
+        );
+        for rule in &provider.rules {
+            anyhow::ensure!(
+                !rule.claims.is_empty() && !rule.caches.is_empty(),
+                "OIDC provider {:?} has a rule without claims or cache grants",
+                provider.name
+            );
+        }
+        if provider.mode == OidcProviderMode::AuthorizationCodePkce {
+            anyhow::ensure!(
+                provider.authorization_endpoint.is_some() && provider.token_endpoint.is_some(),
+                "OIDC PKCE provider {:?} requires authorization-endpoint and token-endpoint",
+                provider.name
+            );
+        }
+    }
+
+    if !config.oidc.providers.is_empty() {
+        anyhow::ensure!(
+            !matches!(
+                &config.jwt.signing_config,
+                JWTSigningConfig::RS256VerifyOnly(_)
+            ),
+            "OIDC token exchange requires an Attic JWT signing key, not token-rs256-pubkey-base64"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod oidc_tests {
+    use super::OidcClaimValue;
+    use serde_json::json;
+
+    #[test]
+    fn claim_values_match_scalars_and_arrays() {
+        assert!(OidcClaimValue::String("admins".to_owned()).matches(&json!("admins")));
+        assert!(OidcClaimValue::String("admins".to_owned()).matches(&json!(["users", "admins"])));
+        assert!(OidcClaimValue::Bool(true).matches(&json!(true)));
+        assert!(OidcClaimValue::Integer(42).matches(&json!([7, 42])));
+        assert!(!OidcClaimValue::String("admins".to_owned()).matches(&json!("users")));
+    }
 }
 
 /// Loads the configuration in the standard order.
