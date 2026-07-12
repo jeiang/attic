@@ -7,9 +7,11 @@ if [[ "$#" -lt "2" ]]; then
 	exit 1
 fi
 
+work_dir=""
+
 cleanup() {
-	if [[ -f "${manifest_spec}" ]]; then
-		rm "${manifest_spec}"
+	if [[ -n "${work_dir}" && -d "${work_dir}" ]]; then
+		rm -rf "${work_dir}"
 	fi
 }
 trap cleanup EXIT
@@ -17,7 +19,16 @@ trap cleanup EXIT
 image_name="$1"
 tags=("${@:2}")
 
-manifest_spec="$(mktemp -t attic-manifest-spec.XXXXXXXXXX)"
+work_dir="$(mktemp -d -t attic-images.XXXXXXXXXX)"
+manifest_spec="${work_dir}/manifest-tool.yaml"
+
+# Do not inherit the host's containers configuration. In particular, recent
+# versions of skopeo reject the v1 registries.conf installed on GitHub runners.
+export XDG_CONFIG_HOME="${work_dir}/config"
+mkdir -p "${XDG_CONFIG_HOME}/containers"
+cat >"${XDG_CONFIG_HOME}/containers/registries.conf" <<'EOF'
+unqualified-search-registries = []
+EOF
 
 declare -a digests
 
@@ -46,10 +57,18 @@ push_digest() {
 
 >>"${manifest_spec}" emit_header
 
-nix build .#attic-server-image .#attic-server-image-aarch64 -L --print-out-paths | \
-while read -r output; do
-	>>"${manifest_spec}" push_digest "${output}"
-done
+if [[ -n "${ATTIC_IMAGE_AMD64:-}" && -n "${ATTIC_IMAGE_ARM64:-}" ]]; then
+	>>"${manifest_spec}" push_digest "${ATTIC_IMAGE_AMD64}"
+	>>"${manifest_spec}" push_digest "${ATTIC_IMAGE_ARM64}"
+elif [[ -n "${ATTIC_IMAGE_AMD64:-}" || -n "${ATTIC_IMAGE_ARM64:-}" ]]; then
+	>&2 echo "ATTIC_IMAGE_AMD64 and ATTIC_IMAGE_ARM64 must be set together"
+	exit 1
+else
+	nix build .#attic-server-image .#attic-server-image-aarch64 --no-link -L --print-out-paths | \
+	while read -r output; do
+		>>"${manifest_spec}" push_digest "${output}"
+	done
+fi
 
 >&2 echo "----------"
 >&2 echo "Generated manifest-tool spec:"
