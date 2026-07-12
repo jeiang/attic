@@ -62,6 +62,15 @@ url = "%database_url%"
 # If enabled, a heartbeat query will be sent every minute
 #heartbeat = false
 
+# The SQLite `mmap_size` pragma, in bytes
+#
+# This only applies when the database URL points to SQLite (it's ignored
+# for PostgreSQL). Larger values can improve read performance for large
+# databases, at the cost of inflating page-cache/RSS accounting under
+# cgroup memory limits. Defaults to 512 MiB. Previously this was
+# hardcoded to ~30 GB.
+#mmap-size = 536870912
+
 # File storage configuration
 [storage]
 # Storage type

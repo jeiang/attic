@@ -151,15 +151,16 @@ impl StateInner {
                     // more details
                     // intentionally ignore errors from this: this is purely for performance,
                     // not for correctness, so we can live without this
+                    let mmap_size = self.config.database.mmap_size;
                     _ = conn
-                        .execute_unprepared(
+                        .execute_unprepared(&format!(
                             "
                         pragma journal_mode=WAL;
                         pragma synchronous=normal;
                         pragma temp_store=memory;
-                        pragma mmap_size = 30000000000;
-                        ",
-                        )
+                        pragma mmap_size = {mmap_size};
+                        "
+                        ))
                         .await;
                 }
 

@@ -380,6 +380,17 @@ pub struct DatabaseConfig {
     /// If enabled, a heartbeat query will be sent every minute.
     #[serde(default = "default_db_heartbeat")]
     pub heartbeat: bool,
+
+    /// The SQLite `mmap_size` pragma, in bytes.
+    ///
+    /// This only applies when the database URL points to SQLite. Larger
+    /// values can improve read performance for large databases, at the
+    /// cost of page-cache/RSS accounting under cgroup memory limits.
+    ///
+    /// Defaults to 512 MiB.
+    #[serde(rename = "mmap-size")]
+    #[serde(default = "default_db_mmap_size")]
+    pub mmap_size: u64,
 }
 
 /// File storage configuration.
@@ -710,6 +721,10 @@ fn default_listen_address() -> SocketAddr {
 
 fn default_db_heartbeat() -> bool {
     false
+}
+
+fn default_db_mmap_size() -> u64 {
+    512 * 1024 * 1024 // 512 MiB
 }
 
 fn default_soft_delete_caches() -> bool {
