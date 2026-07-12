@@ -68,9 +68,11 @@ proxy and S3 behavior can make disconnect-related failures worse.
 
 Automated coverage verifies retry classification, attempt limits, content
 length calculation, request-ID validation and response headers, upload-limit
-validation, and multipart-concurrency validation. Integration-level failures
-still need operator verification because this repository has no proxy or S3
-failure-injection environment.
+validation, and multipart-concurrency validation. The retry tests use
+synthetic transport and status errors only. They do not create a real network
+disconnect, reconstruct a NAR body, or prove a lost response after a server
+commit. Those scenarios remain deferred until a proxy/S3 failure-injection
+environment exists.
 
 Before a production rollout, deliberately interrupt an upload through the
 actual proxy, inspect the matching `X-Request-ID` across proxy and Attic logs,

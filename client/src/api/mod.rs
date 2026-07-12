@@ -622,7 +622,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_disconnect_and_replays_with_fresh_attempts() {
+    async fn synthetic_transport_error_reinvokes_attempt_factory() {
+        // This exercises retry-loop control flow with a synthetic error. It
+        // does not create a network disconnect or reconstruct a NAR body.
         let attempts = Arc::new(Mutex::new(Vec::new()));
         let slept = Arc::new(Mutex::new(Vec::new()));
         let outcome = retry_upload_attempts_with(
@@ -633,7 +635,7 @@ mod tests {
                     std::future::ready(if attempt == 1 {
                         Err(UploadAttemptError::Transport(anyhow!("connection closed")))
                     } else {
-                        Ok("replayed")
+                        Ok("retried")
                     })
                 }
             },
@@ -648,14 +650,16 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome.value, "replayed");
+        assert_eq!(outcome.value, "retried");
         assert_eq!(outcome.attempts, 2);
         assert_eq!(*attempts.lock().unwrap(), [1, 2]);
         assert_eq!(slept.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn lost_response_after_commit_is_replayed() {
+    async fn synthetic_transient_status_retries_after_unknown_outcome() {
+        // This is a synthetic transient HTTP status. It does not prove that a
+        // server committed an upload before a response was lost.
         let attempts = Arc::new(Mutex::new(0));
         let outcome = retry_upload_attempts_with(
             {
