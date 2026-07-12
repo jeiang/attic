@@ -310,6 +310,8 @@ impl StorageBackend for S3Backend {
             completed_parts.push(part?);
         }
         completed_parts.sort_by_key(|part| part.part_number().unwrap_or_default());
+        let part_count = completed_parts.len();
+        tracing::debug!(multipart_outcome = "parts-uploaded", part_count);
 
         let completed_multipart_upload = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
@@ -327,6 +329,7 @@ impl StorageBackend for S3Backend {
             .map_err(ServerError::storage_error)?;
 
         tracing::debug!("complete_multipart_upload -> {:#?}", completion);
+        tracing::info!(multipart_outcome = "completed", part_count);
 
         cleanup.cancel();
 

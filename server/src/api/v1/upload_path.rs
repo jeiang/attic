@@ -3,6 +3,7 @@ use std::io;
 use std::io::Cursor;
 use std::marker::Unpin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use async_compression::Level as CompressionLevel;
@@ -80,7 +81,16 @@ trait UploadPathNarInfoExt {
 /// updated, it means the NAR exists in the global cache and we can deduplicate
 /// after confirming the NAR hash ("Deduplicate" case). Otherwise, we perform
 /// a new upload to the storage backend ("New NAR" case).
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(
+    request_id = %req_state.request_id,
+    cache,
+    store_path_hash,
+    declared_bytes,
+    received_bytes,
+    permit_wait_ms,
+    chunk_count,
+    status
+))]
 #[axum_macros::debug_handler]
 pub(crate) async fn upload_path(
     Extension(state): Extension<State>,
@@ -88,6 +98,7 @@ pub(crate) async fn upload_path(
     headers: HeaderMap,
     body: Body,
 ) -> ServerResult<Json<UploadPathResult>> {
+    let request_started = Instant::now();
     let stream = body.into_data_stream();
     let mut stream =
         StreamReader::new(stream.map(|r| r.map_err(|e| io::Error::other(e.to_string()))));
@@ -136,6 +147,10 @@ pub(crate) async fn upload_path(
         }
     };
     let cache_name = &upload_info.cache;
+    let span = tracing::Span::current();
+    span.record("cache", cache_name.as_str());
+    span.record("store_path_hash", upload_info.store_path_hash.as_str());
+    span.record("declared_bytes", upload_info.nar_size);
 
     let database = state.database().await?;
     let cache = req_state
@@ -150,12 +165,17 @@ pub(crate) async fn upload_path(
 
     // Authentication is intentionally completed before this permit is acquired
     // so unauthenticated requests cannot exhaust the upload budget.
+    let permit_started = Instant::now();
     let _upload_permit = state
         .upload_permits
         .clone()
         .acquire_owned()
         .await
         .expect("upload semaphore is never closed");
+    span.record(
+        "permit_wait_ms",
+        permit_started.elapsed().as_millis() as u64,
+    );
 
     // Try to acquire a lock on an existing NAR
     if let Some(existing_nar) = database.find_and_lock_nar(&upload_info.nar_hash).await? {
@@ -171,7 +191,7 @@ pub(crate) async fn upload_path(
 
         if missing_chunk.is_none() {
             // Can actually be deduplicated
-            return upload_path_dedup(
+            let result = upload_path_dedup(
                 username,
                 cache,
                 upload_info,
@@ -181,10 +201,22 @@ pub(crate) async fn upload_path(
                 existing_nar,
             )
             .await;
+            span.record("status", if result.is_ok() { "success" } else { "error" });
+            tracing::info!(
+                elapsed_ms = request_started.elapsed().as_millis(),
+                "Upload lifecycle completed"
+            );
+            return result;
         }
     }
 
-    upload_path_new(username, cache, upload_info, stream, database, &state).await
+    let result = upload_path_new(username, cache, upload_info, stream, database, &state).await;
+    span.record("status", if result.is_ok() { "success" } else { "error" });
+    tracing::info!(
+        elapsed_ms = request_started.elapsed().as_millis(),
+        "Upload lifecycle completed"
+    );
+    result
 }
 
 /// Uploads a path when there is already a matching NAR in the global cache.
@@ -407,6 +439,8 @@ async fn upload_path_new_chunked(
     if nar_hash != upload_info.nar_hash || *nar_size != upload_info.nar_size {
         return Err(ErrorKind::RequestError(anyhow!("Bad NAR Hash or Size")).into());
     }
+    let span = tracing::Span::current();
+    span.record("received_bytes", *nar_size);
 
     // Request-owned futures are dropped on any error or client cancellation,
     // which cancels sibling chunk uploads before the NAR cleanup guard runs.
@@ -414,6 +448,7 @@ async fn upload_path_new_chunked(
         uploaded_chunks.push(chunk?);
     }
     let chunks = uploaded_chunks;
+    span.record("chunk_count", chunks.len());
 
     let (file_size, deduplicated_size) =
         chunks
@@ -504,6 +539,9 @@ async fn upload_path_new_unchunked(
         state.config.require_proof_of_possession,
     )
     .await?;
+    let span = tracing::Span::current();
+    span.record("received_bytes", upload_info.nar_size);
+    span.record("chunk_count", 1);
     let file_size = chunk.guard.file_size.unwrap() as usize;
 
     // Finally...
@@ -580,6 +618,7 @@ async fn upload_chunk(
     state: State,
     require_proof_of_possession: bool,
 ) -> ServerResult<UploadChunkResult> {
+    let database_started = Instant::now();
     let compression: Compression = compression_type.into();
 
     let given_chunk_hash = data.hash();
@@ -589,6 +628,10 @@ async fn upload_chunk(
         .find_and_lock_chunk(&given_chunk_hash, compression)
         .await?
     {
+        tracing::debug!(
+            database_ms = database_started.elapsed().as_millis(),
+            "Chunk database lookup completed"
+        );
         // There's an existing chunk matching the hash
         if require_proof_of_possession && !data.is_hash_trusted() {
             let stream = data.into_async_buf_read();
@@ -675,10 +718,15 @@ async fn upload_chunk(
     let compressor = get_compressor_fn(compression_type, compression_level);
     let mut stream = CompressionStream::new(data.into_async_buf_read(), compressor);
 
+    let storage_started = Instant::now();
     backend
         .upload_file(key, stream.stream())
         .await
         .map_err(ServerError::storage_error)?;
+    tracing::debug!(
+        storage_ms = storage_started.elapsed().as_millis(),
+        "Chunk storage upload completed"
+    );
 
     // Confirm that the chunk hash is correct
     let (chunk_hash, chunk_size) = stream.nar_hash_and_size().unwrap();
@@ -706,6 +754,10 @@ async fn upload_chunk(
     .exec(&database)
     .await
     .map_err(ServerError::database_error)?;
+    tracing::debug!(
+        database_ms = database_started.elapsed().as_millis(),
+        "Chunk database lifecycle completed"
+    );
 
     cleanup.cancel();
 

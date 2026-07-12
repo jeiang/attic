@@ -48,6 +48,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 
 use access::http::{AuthState, apply_auth};
 use attic::cache::CacheName;
@@ -92,6 +93,9 @@ struct CachedOidcKeyset {
 /// Request state.
 #[derive(Debug)]
 struct RequestStateInner {
+    /// Request identifier returned to the client and included in request spans.
+    request_id: Uuid,
+
     /// Auth state.
     auth: AuthState,
 
