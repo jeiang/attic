@@ -119,6 +119,10 @@ pub struct Config {
     /// Data chunking.
     pub chunking: ChunkingConfig,
 
+    /// Upload concurrency limits.
+    #[serde(default = "Default::default")]
+    pub uploads: UploadConfig,
+
     /// Compression.
     #[serde(default = "Default::default")]
     pub compression: CompressionConfig,
@@ -413,6 +417,31 @@ pub struct ChunkingConfig {
     /// The preferred maximum size of a chunk, in bytes.
     #[serde(rename = "max-size")]
     pub max_size: usize,
+}
+
+/// Upload concurrency limits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadConfig {
+    /// Maximum number of authenticated uploads processed at once.
+    #[serde(rename = "concurrent-uploads", default = "default_concurrent_uploads")]
+    pub concurrent_uploads: usize,
+
+    /// Maximum number of chunks uploaded to storage across all requests at once.
+    #[serde(
+        rename = "concurrent-chunk-uploads",
+        default = "default_concurrent_chunk_uploads"
+    )]
+    pub concurrent_chunk_uploads: usize,
+}
+
+impl Default for UploadConfig {
+    fn default() -> Self {
+        Self {
+            concurrent_uploads: default_concurrent_uploads(),
+            concurrent_chunk_uploads: default_concurrent_chunk_uploads(),
+        }
+    }
 }
 
 /// Compression configuration.
@@ -712,6 +741,14 @@ fn default_max_nar_info_size() -> usize {
     1024 * 1024 // 1 MiB
 }
 
+fn default_concurrent_uploads() -> usize {
+    16
+}
+
+fn default_concurrent_chunk_uploads() -> usize {
+    10
+}
+
 fn default_oidc_scopes() -> Vec<String> {
     vec!["openid".to_string()]
 }
@@ -725,15 +762,32 @@ fn load_config_from_path(path: &Path) -> Result<Config> {
 
     let config = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&config)?;
-    validate_oidc_config(&config)?;
+    validate_config(&config)?;
     Ok(config)
 }
 
 fn load_config_from_str(s: &str) -> Result<Config> {
     tracing::info!("Using configurations from environment variable");
     let config: Config = toml::from_str(s)?;
-    validate_oidc_config(&config)?;
+    validate_config(&config)?;
     Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    validate_upload_config(&config.uploads)?;
+    validate_oidc_config(config)
+}
+
+fn validate_upload_config(config: &UploadConfig) -> Result<()> {
+    anyhow::ensure!(
+        config.concurrent_uploads > 0,
+        "uploads.concurrent-uploads must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.concurrent_chunk_uploads > 0,
+        "uploads.concurrent-chunk-uploads must be greater than zero"
+    );
+    Ok(())
 }
 
 fn validate_oidc_config(config: &Config) -> Result<()> {
@@ -789,7 +843,7 @@ fn validate_oidc_config(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod oidc_tests {
-    use super::OidcClaimValue;
+    use super::{OidcClaimValue, UploadConfig, validate_upload_config};
     use serde_json::json;
 
     #[test]
@@ -799,6 +853,29 @@ mod oidc_tests {
         assert!(OidcClaimValue::Bool(true).matches(&json!(true)));
         assert!(OidcClaimValue::Integer(42).matches(&json!([7, 42])));
         assert!(!OidcClaimValue::String("admins".to_owned()).matches(&json!("users")));
+    }
+
+    #[test]
+    fn upload_limits_default_and_reject_zero() {
+        let defaults = UploadConfig::default();
+        assert_eq!(defaults.concurrent_uploads, 16);
+        assert_eq!(defaults.concurrent_chunk_uploads, 10);
+        assert!(validate_upload_config(&defaults).is_ok());
+
+        assert!(
+            validate_upload_config(&UploadConfig {
+                concurrent_uploads: 0,
+                ..defaults.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_upload_config(&UploadConfig {
+                concurrent_chunk_uploads: 0,
+                ..defaults
+            })
+            .is_err()
+        );
     }
 }
 

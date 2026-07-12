@@ -42,8 +42,8 @@ use sea_orm::{
     ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType, query::Statement,
 };
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -71,6 +71,12 @@ pub struct StateInner {
 
     /// Handle to the storage backend.
     storage: OnceCell<Arc<StorageBackendImpl>>,
+
+    /// Limits whole authenticated uploads across all requests.
+    upload_permits: Arc<Semaphore>,
+
+    /// Limits chunk uploads to storage across all requests.
+    chunk_upload_permits: Arc<Semaphore>,
 
     /// Cached JSON Web Key Sets for OIDC providers.
     oidc_keysets: Mutex<HashMap<String, CachedOidcKeyset>>,
@@ -110,10 +116,16 @@ struct RequestStateInner {
 
 impl StateInner {
     async fn new(config: Config) -> State {
+        let upload_permits = Arc::new(Semaphore::new(config.uploads.concurrent_uploads));
+        let chunk_upload_permits =
+            Arc::new(Semaphore::new(config.uploads.concurrent_chunk_uploads));
+
         Arc::new(Self {
             config,
             database: OnceCell::new(),
             storage: OnceCell::new(),
+            upload_permits,
+            chunk_upload_permits,
             oidc_keysets: Mutex::new(HashMap::new()),
         })
     }

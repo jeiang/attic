@@ -104,6 +104,12 @@ avg-size = 65536            # 64 KiB
 # The preferred maximum size of a chunk, in bytes
 max-size = 262144           # 256 KiB
 
+# Upload concurrency limits. Whole-upload permits are acquired after
+# authentication. Chunk permits are shared by all active uploads.
+[uploads]
+concurrent-uploads = 16
+concurrent-chunk-uploads = 10
+
 # Compression
 [compression]
 # Compression type

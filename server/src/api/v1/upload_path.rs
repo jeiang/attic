@@ -15,14 +15,13 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures::StreamExt;
-use futures::future::join_all;
+use futures::stream::FuturesUnordered;
 use sea_orm::ActiveValue::Set;
 use sea_orm::entity::prelude::*;
 use sea_orm::{QuerySelect, TransactionTrait};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncReadExt};
 use tokio::sync::Semaphore;
-use tokio::task::spawn;
 use tokio_util::io::StreamReader;
 use tracing::instrument;
 use uuid::Uuid;
@@ -148,6 +147,15 @@ pub(crate) async fn upload_path(
         .await?;
 
     let username = req_state.auth.username().map(str::to_string);
+
+    // Authentication is intentionally completed before this permit is acquired
+    // so unauthenticated requests cannot exhaust the upload budget.
+    let _upload_permit = state
+        .upload_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("upload semaphore is never closed");
 
     // Try to acquire a lock on an existing NAR
     if let Some(existing_nar) = database.find_and_lock_nar(&upload_info.nar_hash).await? {
@@ -322,10 +330,25 @@ async fn upload_path_new_chunked(
     );
 
     let upload_chunk_limit = Arc::new(Semaphore::new(CONCURRENT_CHUNK_UPLOADS));
-    let mut futures = Vec::new();
+    let mut uploads = FuturesUnordered::new();
+    let mut uploaded_chunks = Vec::new();
 
     let mut chunk_idx = 0;
-    while let Some(bytes) = chunks.next().await {
+    loop {
+        // Poll request-owned upload futures before accepting more data. This
+        // preserves the existing per-request bound without detached work.
+        if uploads.len() == CONCURRENT_CHUNK_UPLOADS {
+            uploaded_chunks.push(
+                uploads
+                    .next()
+                    .await
+                    .expect("the upload queue is non-empty")?,
+            );
+        }
+
+        let Some(bytes) = chunks.next().await else {
+            break;
+        };
         let bytes = bytes.map_err(ServerError::request_error)?;
         let data = ChunkData::Bytes(bytes);
 
@@ -334,12 +357,20 @@ async fn upload_path_new_chunked(
         // We want to block the receive process as well, otherwise it stays ahead and
         // consumes too much memory
         let permit = upload_chunk_limit.clone().acquire_owned().await.unwrap();
-        futures.push({
+        uploads.push({
             let database = database.clone();
             let state = state.clone();
             let require_proof_of_possession = state.config.require_proof_of_possession;
+            let global_upload_limit = state.chunk_upload_permits.clone();
 
-            spawn(async move {
+            async move {
+                // A request-local slot is held while waiting for the global
+                // slot, bounding both active uploads and queued chunk data.
+                let _request_permit = permit;
+                let _global_permit = global_upload_limit
+                    .acquire_owned()
+                    .await
+                    .expect("chunk upload semaphore is never closed");
                 let chunk = upload_chunk(
                     data,
                     compression_type,
@@ -361,9 +392,8 @@ async fn upload_path_new_chunked(
                 .await
                 .map_err(ServerError::database_error)?;
 
-                drop(permit);
-                Ok(chunk)
-            })
+                Ok::<UploadChunkResult, ServerError>(chunk)
+            }
         });
 
         chunk_idx += 1;
@@ -378,12 +408,12 @@ async fn upload_path_new_chunked(
         return Err(ErrorKind::RequestError(anyhow!("Bad NAR Hash or Size")).into());
     }
 
-    // Wait for all uploads to complete
-    let chunks: Vec<UploadChunkResult> = join_all(futures)
-        .await
-        .into_iter()
-        .map(|join_result| join_result.unwrap())
-        .collect::<ServerResult<Vec<_>>>()?;
+    // Request-owned futures are dropped on any error or client cancellation,
+    // which cancels sibling chunk uploads before the NAR cleanup guard runs.
+    while let Some(chunk) = uploads.next().await {
+        uploaded_chunks.push(chunk?);
+    }
+    let chunks = uploaded_chunks;
 
     let (file_size, deduplicated_size) =
         chunks
