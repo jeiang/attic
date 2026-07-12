@@ -55,7 +55,7 @@ use attic::cache::CacheName;
 use config::{Config, StorageConfig};
 use database::migration::{Migrator, MigratorTrait};
 use error::{ErrorKind, ServerError, ServerResult};
-use middleware::{init_request_state, restrict_host, set_visibility_header};
+use middleware::{assign_request_id, init_request_state, restrict_host, set_visibility_header};
 use storage::{LocalBackend, S3Backend, StorageBackendImpl};
 
 type State = Arc<StateInner>;
@@ -117,6 +117,9 @@ struct RequestStateInner {
     /// header in responses.
     public_cache: AtomicBool,
 }
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestId(pub Uuid);
 
 impl StateInner {
     async fn new(config: Config) -> State {
@@ -273,7 +276,8 @@ pub async fn run_api_server(
         .layer(axum::middleware::from_fn(restrict_host))
         .layer(Extension(state.clone()))
         .layer(TraceLayer::new_for_http())
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::new())
+        .layer(axum::middleware::from_fn(assign_request_id));
 
     eprintln!("Listening on {:?}...", listen);
 

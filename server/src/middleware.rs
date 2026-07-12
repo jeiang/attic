@@ -14,7 +14,7 @@ use axum::{
 use tracing::Instrument;
 use uuid::Uuid;
 
-use super::{AuthState, RequestState, RequestStateInner, State};
+use super::{AuthState, RequestId, RequestState, RequestStateInner, State};
 use crate::error::{ErrorKind, ServerResult};
 use attic::api::binary_cache::ATTIC_CACHE_VISIBILITY;
 
@@ -38,14 +38,22 @@ fn request_id(headers: &HeaderMap) -> Uuid {
         .unwrap_or_else(Uuid::new_v4)
 }
 
+/// Selects a safe request ID before the rest of the application stack runs.
+pub async fn assign_request_id(mut req: Request, next: Next) -> Response {
+    let request_id = RequestId(request_id(req.headers()));
+    req.extensions_mut().insert(request_id);
+    let span = tracing::info_span!("request", request_id = %request_id.0);
+    set_request_id_header(next.run(req).instrument(span).await, request_id.0)
+}
+
 /// Initializes per-request state.
 pub async fn init_request_state(
     Extension(state): Extension<State>,
+    Extension(request_id): Extension<RequestId>,
     mut req: Request,
     next: Next,
 ) -> ServerResult<Response> {
     let host = host_header(&req)?;
-    let request_id = request_id(req.headers());
     // X-Forwarded-Proto is an untrusted header
     let client_claims_https =
         if let Some(x_forwarded_proto) = req.headers().get("x-forwarded-proto") {
@@ -55,7 +63,7 @@ pub async fn init_request_state(
         };
 
     let req_state = Arc::new(RequestStateInner {
-        request_id,
+        request_id: request_id.0,
         auth: AuthState::new(),
         api_endpoint: state.config.api_endpoint.to_owned(),
         substituter_endpoint: state.config.substituter_endpoint.to_owned(),
@@ -65,11 +73,7 @@ pub async fn init_request_state(
     });
 
     req.extensions_mut().insert(req_state);
-    let span = tracing::info_span!("request", request_id = %request_id);
-    Ok(set_request_id_header(
-        next.run(req).instrument(span).await,
-        request_id,
-    ))
+    Ok(next.run(req).await)
 }
 
 fn set_request_id_header(mut response: Response, request_id: Uuid) -> Response {
@@ -102,13 +106,17 @@ pub async fn restrict_host(
 #[cfg(test)]
 mod tests {
     use axum::{
+        Router,
         body::Body,
-        http::{HeaderMap, HeaderValue},
+        http::{HeaderMap, HeaderValue, Request, StatusCode},
+        middleware,
         response::Response,
+        routing::get,
     };
+    use tower::ServiceExt;
     use uuid::Uuid;
 
-    use super::{REQUEST_ID, request_id, set_request_id_header};
+    use super::{REQUEST_ID, assign_request_id, request_id, set_request_id_header};
 
     #[test]
     fn request_id_reuses_valid_uuid_and_rejects_untrusted_values() {
@@ -133,6 +141,86 @@ mod tests {
                 .to_str()
                 .unwrap(),
             request_id.to_string()
+        );
+    }
+
+    fn app(status: StatusCode) -> Router {
+        Router::new()
+            .route("/", get(move || async move { status }))
+            .layer(middleware::from_fn(assign_request_id))
+    }
+
+    #[tokio::test]
+    async fn production_request_id_layer_covers_success_and_handler_errors() {
+        let valid = "c5a15b09-459f-4d7d-a424-6e5ed655c379";
+        let response = app(StatusCode::OK)
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(REQUEST_ID, valid)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(REQUEST_ID).unwrap(), valid);
+
+        let generated = app(StatusCode::BAD_REQUEST)
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(REQUEST_ID, "invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generated.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            Uuid::parse_str(
+                generated
+                    .headers()
+                    .get(REQUEST_ID)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn production_request_id_layer_covers_missing_ids_and_inner_rejections() {
+        let missing = app(StatusCode::INTERNAL_SERVER_ERROR)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            Uuid::parse_str(missing.headers().get(REQUEST_ID).unwrap().to_str().unwrap()).is_ok()
+        );
+
+        let rejection = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(
+                |_req: Request<Body>, _next: middleware::Next| async { StatusCode::FORBIDDEN },
+            ))
+            .layer(middleware::from_fn(assign_request_id))
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
+        assert!(
+            Uuid::parse_str(
+                rejection
+                    .headers()
+                    .get(REQUEST_ID)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            )
+            .is_ok()
         );
     }
 }

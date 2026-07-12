@@ -22,9 +22,14 @@ but clients cannot resume from an arbitrary byte or chunk offset.
 ## Correlation and safe logging
 
 Attic accepts a valid UUID in `X-Request-ID`, otherwise generates one, and
-returns the chosen UUID in every response that reaches the request middleware.
+returns the chosen UUID in every application response, including rejected
+requests and handler errors.
 Pass that value through the proxy and use it to correlate client, proxy, and
 server events.
+
+TLS negotiation, connection failures, and failures that occur before Axum
+receives a request cannot receive an application request ID. Use proxy and
+load-balancer connection logs for those cases.
 
 Upload logs record cache name, store path hash, declared and received byte
 counts, chunk count, permit wait, timing, cleanup messages, storage/multipart
