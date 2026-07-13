@@ -3,7 +3,13 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
+
+permissions:
+  contents: read
+  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -36,19 +42,10 @@ jobs:
 
       - name: Configure Attic
         continue-on-error: true
-        run: |
-          : "${ATTIC_SERVER:=https://staging.attic.rs/}"
-          : "${ATTIC_CACHE:=attic-ci}"
-          export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          attic login --set-default ci "$ATTIC_SERVER" "$ATTIC_TOKEN"
-          attic use "$ATTIC_CACHE"
-          if [ -n "$ATTIC_TOKEN" ]; then
-            echo ATTIC_CACHE=$ATTIC_CACHE >>$GITHUB_ENV
-          fi
+        run: ./.ci/configure-attic.sh
         env:
           ATTIC_SERVER: ${{ secrets.ATTIC_SERVER }}
           ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
-          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
 
       - name: Cache dev shell
         run: |
@@ -64,7 +61,7 @@ jobs:
             .#attic \
             .#attic-client \
             .#attic-server \
-          | if [ -n "$ATTIC_CACHE" ]; then
+          | if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
             xargs attic push "ci:$ATTIC_CACHE"
           else
             cat
@@ -99,19 +96,10 @@ jobs:
 
       - name: Configure Attic
         continue-on-error: true
-        run: |
-          : "${ATTIC_SERVER:=https://staging.attic.rs/}"
-          : "${ATTIC_CACHE:=attic-ci}"
-          export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          attic login --set-default ci "$ATTIC_SERVER" "$ATTIC_TOKEN"
-          attic use "$ATTIC_CACHE"
-          if [ -n "$ATTIC_TOKEN" ]; then
-            echo ATTIC_CACHE=$ATTIC_CACHE >>$GITHUB_ENV
-          fi
+        run: ./.ci/configure-attic.sh
         env:
           ATTIC_SERVER: ${{ secrets.ATTIC_SERVER }}
           ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
-          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
 
       - name: Cache dev shell
         run: |
@@ -132,7 +120,7 @@ jobs:
       - name: Push build artifacts
         run: |
           export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          if [ -n "$ATTIC_CACHE" ]; then
+          if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
             nix build --no-link --print-out-paths -L \
               .#internalMatrix."$system".\"${{ matrix.nix }}\".attic-tests \
               .#internalMatrix."$system".\"${{ matrix.nix }}\".cargoArtifacts \
@@ -156,19 +144,10 @@ jobs:
 
       - name: Configure Attic
         continue-on-error: true
-        run: |
-          : "${ATTIC_SERVER:=https://staging.attic.rs/}"
-          : "${ATTIC_CACHE:=attic-ci}"
-          export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          attic login --set-default ci "$ATTIC_SERVER" "$ATTIC_TOKEN"
-          attic use "$ATTIC_CACHE"
-          if [ -n "$ATTIC_TOKEN" ]; then
-            echo ATTIC_CACHE=$ATTIC_CACHE >>$GITHUB_ENV
-          fi
+        run: ./.ci/configure-attic.sh
         env:
           ATTIC_SERVER: ${{ secrets.ATTIC_SERVER }}
           ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
-          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
       - id: set-matrix
         name: Generate Nix Matrix
         run: |
@@ -203,25 +182,106 @@ jobs:
 
       - name: Configure Attic
         continue-on-error: true
-        run: |
-          : "${ATTIC_SERVER:=https://staging.attic.rs/}"
-          : "${ATTIC_CACHE:=attic-ci}"
-          export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          attic login --set-default ci "$ATTIC_SERVER" "$ATTIC_TOKEN"
-          attic use "$ATTIC_CACHE"
-          if [ -n "$ATTIC_TOKEN" ]; then
-            echo ATTIC_CACHE=$ATTIC_CACHE >>$GITHUB_ENV
-          fi
+        run: ./.ci/configure-attic.sh
         env:
           ATTIC_SERVER: ${{ secrets.ATTIC_SERVER }}
           ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
-          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
 
       - name: Build ${{ matrix.attr }}
         run: |
           nix build --no-link --print-out-paths -L '.#${{ matrix.attr }}' \
-          | if [ -n "$ATTIC_CACHE" ]; then
+          | if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
             xargs attic push "ci:$ATTIC_CACHE"
           else
             cat
+          fi
+
+  container:
+    name: Build, validate, and publish container images
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7.0.0
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+        continue-on-error: true # Self-hosted runners already have Nix installed
+
+      - name: Cache dev shell
+        run: .ci/cache-shell.sh
+
+      - name: Install Attic
+        run: |
+          if ! command -v attic &> /dev/null; then
+            ./.github/install-attic-ci.sh
+          fi
+
+      - name: Configure Attic
+        continue-on-error: true
+        run: ./.ci/configure-attic.sh
+        env:
+          ATTIC_SERVER: ${{ secrets.ATTIC_SERVER }}
+          ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
+
+      - id: images
+        name: Build container images
+        shell: bash
+        run: |
+          echo "amd64=$(nix build --no-link --print-out-paths -L .#attic-server-image)" >>"$GITHUB_OUTPUT"
+          echo "arm64=$(nix build --no-link --print-out-paths -L .#attic-server-image-aarch64)" >>"$GITHUB_OUTPUT"
+
+      - name: Inspect container images
+        shell: bash
+        run: |
+          .ci/run skopeo inspect "docker-archive:${{ steps.images.outputs.amd64 }}" | \
+            .ci/run jq -e '.Os == "linux" and .Architecture == "amd64"'
+          .ci/run skopeo inspect "docker-archive:${{ steps.images.outputs.arm64 }}" | \
+            .ci/run jq -e '.Os == "linux" and .Architecture == "arm64"'
+
+          docker load <"${{ steps.images.outputs.amd64 }}"
+          docker run --rm attic-server:main --version
+
+      - name: Log in to the Container registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-architecture image
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          ATTIC_IMAGE_AMD64: ${{ steps.images.outputs.amd64 }}
+          ATTIC_IMAGE_ARM64: ${{ steps.images.outputs.arm64 }}
+        run: |
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tags=("$GITHUB_SHA")
+
+          if [[ "$GITHUB_REF_TYPE" == "branch" ]]; then
+            tags+=("latest")
+          else
+            version="${GITHUB_REF_NAME#v}"
+            if [[ -z "$version" ]]; then
+              echo "Version tags must include a value after the v prefix." >&2
+              exit 1
+            fi
+            tags+=("$version")
+          fi
+
+          .ci/run just ci-build-and-push-images "$image_name" "${tags[@]}"
+
+      - name: Push image store paths
+        shell: bash
+        run: |
+          export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
+          if [ -n "$ATTIC_CACHE" ]; then
+            attic push "ci:$ATTIC_CACHE" \
+              "${{ steps.images.outputs.amd64 }}" \
+              "${{ steps.images.outputs.arm64 }}"
           fi

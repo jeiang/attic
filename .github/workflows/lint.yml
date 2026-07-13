@@ -6,6 +6,10 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+  id-token: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -34,17 +38,11 @@ jobs:
           fi
 
       - name: Configure Attic
-        run: |
-          : "${ATTIC_SERVER:=https://staging.attic.rs/}"
-          : "${ATTIC_CACHE:=attic-ci}"
-          echo ATTIC_CACHE=$ATTIC_CACHE >>$GITHUB_ENV
-          export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          attic login --set-default ci "$ATTIC_SERVER" "$ATTIC_TOKEN"
-          attic use "$ATTIC_CACHE"
+        continue-on-error: true
+        run: ./.ci/configure-attic.sh
         env:
           ATTIC_SERVER: ${{ secrets.ATTIC_SERVER }}
           ATTIC_CACHE: ${{ secrets.ATTIC_CACHE }}
-          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
 
       - name: Cache dev shell
         run: |
