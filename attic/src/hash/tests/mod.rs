@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::error::AtticError;
+#[cfg(feature = "nix_store")]
 use crate::nix_store::tests::test_nar;
 
 const BLOB: &[u8] = include_bytes!("blob");
@@ -16,6 +17,7 @@ fn test_basic() {
     assert_eq!(expected_base32, hash.to_typed_base32());
 }
 
+#[cfg(feature = "nix_store")]
 #[test]
 fn test_nar_hash() {
     let nar = test_nar::NO_DEPS;

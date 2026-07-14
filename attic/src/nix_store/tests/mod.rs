@@ -1,19 +1,25 @@
 use super::*;
 
+#[cfg(feature = "nix_store")]
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+#[cfg(feature = "nix_store")]
 use std::process::Command;
 
+#[cfg(feature = "nix_store")]
 use serde::de::DeserializeOwned;
 
+#[cfg(feature = "nix_store")]
 pub mod test_nar;
 
+#[cfg(feature = "nix_store")]
 fn connect() -> NixStore {
     NixStore::connect().expect("Failed to connect to the Nix store")
 }
 
 /// Evaluates a Nix expression using the command-line interface.
+#[cfg(feature = "nix_store")]
 fn cli_eval<T>(expression: &str) -> T
 where
     T: DeserializeOwned,
@@ -51,11 +57,13 @@ fn assert_base_name_err(store: &str, path: &str, err: &str) {
     }
 }
 
+#[cfg(feature = "nix_store")]
 #[test]
 fn test_connect() {
     connect();
 }
 
+#[cfg(feature = "nix_store")]
 #[test]
 fn test_store_dir() {
     let store = connect();
@@ -142,6 +150,7 @@ fn test_store_path_hash() {
     StorePathHash::new(h).unwrap_err();
 }
 
+#[cfg(feature = "nix_store")]
 #[tokio::test]
 async fn test_nar_streaming() {
     let store = NixStore::connect().expect("Failed to connect to the Nix store");
@@ -163,6 +172,7 @@ async fn test_nar_streaming() {
         .expect("Could not validate resulting dump");
 }
 
+#[cfg(feature = "nix_store")]
 #[tokio::test]
 async fn test_compute_fs_closure() {
     use test_nar::{WITH_DEPS_A, WITH_DEPS_B, WITH_DEPS_C};
@@ -187,6 +197,7 @@ async fn test_compute_fs_closure() {
     }
 }
 
+#[cfg(feature = "nix_store")]
 #[tokio::test]
 async fn test_compute_fs_closure_multi() {
     use test_nar::{NO_DEPS, WITH_DEPS_A, WITH_DEPS_B, WITH_DEPS_C};
@@ -217,6 +228,7 @@ async fn test_compute_fs_closure_multi() {
     assert_eq!(expected, actual);
 }
 
+#[cfg(feature = "nix_store")]
 #[tokio::test]
 async fn test_query_path_info() {
     use test_nar::{WITH_DEPS_B, WITH_DEPS_C};
