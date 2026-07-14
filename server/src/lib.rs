@@ -39,8 +39,11 @@ use axum::{
     http::{Uri, uri::Scheme},
 };
 use sea_orm::{
-    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseConnectionType,
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, SqlxSqliteConnector,
     query::Statement,
+    sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+    },
 };
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
@@ -143,6 +146,10 @@ impl StateInner {
     async fn database(&self) -> ServerResult<&DatabaseConnection> {
         self.database
             .get_or_try_init(|| async {
+                if self.config.database.url.starts_with("sqlite:") {
+                    return self.connect_sqlite().await;
+                }
+
                 let mut connect_options = ConnectOptions::new(self.config.database.url.clone());
                 if let Some(max_connections) = self.config.database.max_connections {
                     connect_options.max_connections(max_connections);
@@ -154,33 +161,46 @@ impl StateInner {
                     connect_options.idle_timeout(idle_timeout);
                 }
 
-                let db = Database::connect(connect_options)
+                Database::connect(connect_options)
                     .await
-                    .map_err(ServerError::database_error);
-                if let Ok(db_conn) = &db
-                    && let DatabaseConnectionType::SqlxSqlitePoolConnection(conn) = &db_conn.inner
-                {
-                    // execute some sqlite-specific performance optimizations
-                    // see https://phiresky.github.io/blog/2020/sqlite-performance-tuning/ for
-                    // more details
-                    // intentionally ignore errors from this: this is purely for performance,
-                    // not for correctness, so we can live without this
-                    let mmap_size = self.config.database.mmap_size;
-                    _ = conn
-                        .execute_unprepared(&format!(
-                            "
-                        pragma journal_mode=WAL;
-                        pragma synchronous=normal;
-                        pragma temp_store=memory;
-                        pragma mmap_size = {mmap_size};
-                        "
-                        ))
-                        .await;
-                }
-
-                db
+                    .map_err(ServerError::database_error)
             })
             .await
+    }
+
+    /// Connects to a SQLite database.
+    ///
+    /// The tuning pragmas are set as connect options so that every
+    /// pooled connection gets them, not only the first one handed out.
+    /// See <https://phiresky.github.io/blog/2020/sqlite-performance-tuning/>.
+    async fn connect_sqlite(&self) -> ServerResult<DatabaseConnection> {
+        use std::str::FromStr;
+
+        let connect_options = SqliteConnectOptions::from_str(&self.config.database.url)
+            .map_err(ServerError::database_error)?
+            .busy_timeout(self.config.database.busy_timeout)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .pragma("temp_store", "memory")
+            .pragma("mmap_size", self.config.database.mmap_size.to_string());
+
+        let mut pool_options = SqlitePoolOptions::new();
+        if let Some(max_connections) = self.config.database.max_connections {
+            pool_options = pool_options.max_connections(max_connections);
+        }
+        if let Some(min_connections) = self.config.database.min_connections {
+            pool_options = pool_options.min_connections(min_connections);
+        }
+        if let Some(idle_timeout) = self.config.database.idle_timeout {
+            pool_options = pool_options.idle_timeout(idle_timeout);
+        }
+
+        let pool = pool_options
+            .connect_with(connect_options)
+            .await
+            .map_err(ServerError::database_error)?;
+
+        Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
     }
 
     /// Acquires the configured global upload permit, if enabled.

@@ -62,6 +62,13 @@ url = "%database_url%"
 # If enabled, a heartbeat query will be sent every minute
 #heartbeat = false
 
+# Maximum connections in the database pool
+#max-connections = 10
+
+# How long SQLite waits for a locked database before failing with
+# SQLITE_BUSY (applies to every pooled connection)
+#busy-timeout = "30 seconds"
+
 # The SQLite `mmap_size` pragma, in bytes
 #
 # This only applies when the database URL points to SQLite (it's ignored
