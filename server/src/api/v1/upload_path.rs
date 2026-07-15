@@ -676,8 +676,34 @@ async fn upload_chunk(
     let chunk_started = Instant::now();
     let compression: Compression = compression_type.into();
 
-    let given_chunk_hash = data.hash();
-    let given_chunk_size = data.size();
+    // For `ChunkData::Bytes`, the data is an immutable in-memory buffer that
+    // the server itself produced (e.g. from chunking the incoming NAR
+    // stream), so its hash is trustworthy. We compute it once here (off the
+    // async executor, since hashing is CPU-bound) and reuse it below to skip
+    // the otherwise-redundant NAR-hash pass inside `CompressionStream`.
+    //
+    // For `ChunkData::Stream`, the hash is client-claimed and potentially
+    // incorrect, so it cannot be precomputed - it's verified in-pipeline
+    // instead.
+    let (given_chunk_hash, given_chunk_size, precomputed_nar_hash) = match &data {
+        ChunkData::Bytes(bytes) => {
+            let bytes = bytes.clone();
+            let size = bytes.len();
+
+            let digest = tokio::task::spawn_blocking(move || {
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                hasher.finalize()
+            })
+            .await
+            .map_err(|_| ErrorKind::InternalServerError)?;
+
+            let hash = Hash::Sha256((&digest[..]).try_into().unwrap());
+
+            (hash, size, Some((digest, size)))
+        }
+        ChunkData::Stream(_, hash, size) => (hash.clone(), *size, None),
+    };
 
     let lookup_started = Instant::now();
     let existing_chunk = match database
@@ -808,8 +834,20 @@ async fn upload_chunk(
     });
 
     // Compress and stream to the storage backend
-    let compressor = get_compressor_fn(compression_type, compression_level);
-    let mut stream = CompressionStream::new(data.into_async_buf_read(), compressor);
+    let mut stream = match precomputed_nar_hash {
+        Some(pre) => {
+            let compressor = get_compressor_fn(compression_type, compression_level);
+            CompressionStream::with_precomputed_nar_hash(
+                data.into_async_buf_read(),
+                compressor,
+                pre,
+            )
+        }
+        None => {
+            let compressor = get_compressor_fn(compression_type, compression_level);
+            CompressionStream::new(data.into_async_buf_read(), compressor)
+        }
+    };
 
     let storage_started = Instant::now();
     backend
@@ -897,27 +935,6 @@ fn get_compressor_fn<C: AsyncBufRead + Unpin + Send + 'static>(
 }
 
 impl ChunkData {
-    /// Returns the potentially-incorrect hash of the chunk.
-    fn hash(&self) -> Hash {
-        match self {
-            Self::Bytes(bytes) => {
-                let mut hasher = Sha256::new();
-                hasher.update(bytes);
-                let hash = hasher.finalize();
-                Hash::Sha256((&hash[..]).try_into().unwrap())
-            }
-            Self::Stream(_, hash, _) => hash.clone(),
-        }
-    }
-
-    /// Returns the potentially-incorrect size of the chunk.
-    fn size(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => bytes.len(),
-            Self::Stream(_, _, size) => *size,
-        }
-    }
-
     /// Returns whether the hash is trusted.
     fn is_hash_trusted(&self) -> bool {
         matches!(self, ChunkData::Bytes(_))
