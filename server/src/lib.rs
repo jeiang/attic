@@ -41,9 +41,7 @@ use axum::{
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, SqlxSqliteConnector,
     query::Statement,
-    sqlx::sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-    },
+    sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
