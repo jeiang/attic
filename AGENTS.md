@@ -56,11 +56,13 @@ Non-crate directories:
   and `token` must keep building for `wasm32-unknown-unknown`
   (`just ci-build-wasm`). Don't add default dependencies to those crates that
   break WASM.
-- Integration tests (Linux only, NixOS VMs):
-  `nix build .#integration-tests.basic-sqlite-local` etc. The matrix is
-  database × storage = {sqlite, postgres} × {local, garage}, defined in
-  `integration-tests/default.nix`. Run the relevant combination when touching
-  server storage, database, or API behavior.
+- Integration tests (Linux only, NixOS VMs, exposed as flake checks):
+  `nix build .#checks.x86_64-linux.basic-sqlite-local` etc. The matrix is
+  database × storage = {sqlite, postgres} × {local, garage}, plus `stable-*`
+  variants (tested against nixpkgs-stable), defined in
+  `integration-tests/default.nix` and wired up in `flake/integration-tests.nix`.
+  Run the relevant combination when touching server storage, database, or API
+  behavior.
 
 ## Conventions
 
