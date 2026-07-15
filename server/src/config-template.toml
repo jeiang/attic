@@ -86,6 +86,14 @@ url = "%database_url%"
 # only validated when max-connections is set explicitly.
 #min-connections = 0
 
+# How long SQLite waits for a locked database before failing with
+# SQLITE_BUSY
+#
+# This only applies when the database URL points to SQLite. It is set on
+# every pooled connection. Defaults to 30 seconds (sqlx's default is 5
+# seconds, which concurrent chunked uploads routinely exceed).
+#busy-timeout = "30 seconds"
+
 # How long a connection may remain idle in the pool before being closed
 #
 # If unset, the sqlx default is used (idle connections are not proactively

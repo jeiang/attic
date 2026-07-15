@@ -377,6 +377,13 @@ pub struct DatabaseConfig {
     #[serde(default = "default_db_mmap_size")]
     pub mmap_size: u64,
 
+    /// How long SQLite waits for a locked database before failing
+    /// with SQLITE_BUSY. Applies to every pooled connection.
+    #[serde(rename = "busy-timeout")]
+    #[serde(with = "humantime_serde")]
+    #[serde(default = "default_db_busy_timeout")]
+    pub busy_timeout: Duration,
+
     /// Maximum connections in the database pool.
     #[serde(rename = "max-connections")]
     #[serde(default)]
@@ -750,6 +757,10 @@ fn default_max_concurrent_chunk_uploads() -> usize {
 
 fn default_db_mmap_size() -> u64 {
     512 * 1024 * 1024
+}
+
+fn default_db_busy_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn default_oidc_scopes() -> Vec<String> {
