@@ -55,6 +55,15 @@ use crate::database::{AtticDatabase, ChunkGuard, NarGuard};
 /// TODO: Make this configurable
 const CONCURRENT_CHUNK_UPLOADS: usize = 10;
 
+/// Maximum number of chunkref rows to insert per statement.
+///
+/// `chunkref` inserts are batched at the end of a chunked upload (see
+/// `upload_path_new_chunked`) rather than issued one at a time per chunk.
+/// 1000 rows keeps the bind-parameter count (4 per row) comfortably under
+/// every supported backend's limit; see the similar batching rationale in
+/// `gc::run_reap_orphan_chunks`.
+const CHUNKREF_INSERT_BATCH_SIZE: usize = 1000;
+
 /// Data of a chunk.
 enum ChunkData {
     /// Some bytes in memory.
@@ -468,18 +477,12 @@ async fn upload_path_new_chunked(
                 )
                 .await?;
 
-                // Create mapping from the NAR to the chunk
-                ChunkRef::insert(chunkref::ActiveModel {
-                    nar_id: Set(nar_id),
-                    seq: Set(chunk_idx),
-                    chunk_id: Set(Some(chunk.guard.id)),
-                    ..Default::default()
-                })
-                .exec(&database)
-                .await
-                .map_err(ServerError::database_error)?;
-
-                Ok::<UploadChunkResult, ServerError>(chunk)
+                // The NAR-to-chunk mapping (`chunkref`) is not written here.
+                // Chunks complete out of order and are only meaningful once
+                // the NAR itself is marked `Valid`, so all chunkrefs for
+                // this upload are batch-inserted together in the final
+                // transaction below.
+                Ok::<(i32, UploadChunkResult), ServerError>((chunk_idx, chunk))
             }
         });
 
@@ -502,13 +505,17 @@ async fn upload_path_new_chunked(
     while let Some(chunk) = uploads.next().await {
         uploaded_chunks.push(chunk?);
     }
-    let chunks = uploaded_chunks;
+    let mut chunks = uploaded_chunks;
+    // Futures complete out of order; sort by the original chunk index for
+    // insert locality when writing chunkrefs below. Not required for
+    // correctness since each row carries its own `seq`.
+    chunks.sort_unstable_by_key(|(idx, _)| *idx);
     span.record("chunk_count", chunks.len());
 
     let (file_size, deduplicated_size) =
         chunks
             .iter()
-            .fold((0, 0), |(file_size, deduplicated_size), c| {
+            .fold((0, 0), |(file_size, deduplicated_size), (_idx, c)| {
                 (
                     file_size + c.guard.file_size.unwrap() as usize,
                     if c.deduplicated {
@@ -535,6 +542,27 @@ async fn upload_path_new_chunked(
     .exec(&txn)
     .await
     .map_err(ServerError::database_error)?;
+
+    // Create the NAR-to-chunk mappings. These are only meaningful once the
+    // NAR is `Valid` (see above), so they're deferred from the per-chunk
+    // upload futures to here and inserted in batches, rather than one
+    // `chunkref` row per statement, to cut down on DB round-trips.
+    let chunkref_models: Vec<chunkref::ActiveModel> = chunks
+        .iter()
+        .map(|(idx, chunk)| chunkref::ActiveModel {
+            nar_id: Set(nar_id),
+            seq: Set(*idx),
+            chunk_id: Set(Some(chunk.guard.id)),
+            ..Default::default()
+        })
+        .collect();
+
+    for batch in chunkref_models.chunks(CHUNKREF_INSERT_BATCH_SIZE) {
+        ChunkRef::insert_many(batch.to_vec())
+            .exec(&txn)
+            .await
+            .map_err(ServerError::database_error)?;
+    }
 
     // Create a mapping granting the local cache access to the NAR
     Object::insert({
