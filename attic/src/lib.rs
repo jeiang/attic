@@ -26,7 +26,7 @@ pub mod io;
 pub mod mime;
 pub mod nix_store;
 pub mod signing;
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", feature = "tokio"))]
 pub mod testing;
 #[cfg(feature = "tokio")]
 pub mod util;
