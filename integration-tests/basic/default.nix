@@ -3,10 +3,29 @@ let
   inherit (lib) types;
 
   serverConfigFile = config.nodes.server.services.atticd.configFile;
+  serverPackage = config.nodes.server.services.atticd.package;
 
   cmd = {
     atticadm = ". /etc/atticd.env && export ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64 && atticd-atticadm";
-    atticd = ". /etc/atticd.env && export ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64 && atticd -f ${serverConfigFile}";
+    # One-off atticd invocations (e.g. triggering GC) must run under the
+    # same dynamic user and state directory as the atticd service: the
+    # database URL names the "atticd" user explicitly, so a root-run
+    # invocation would fail postgres peer authentication.
+    atticd = lib.concatStringsSep " " [
+      "systemd-run"
+      "--quiet"
+      "--pipe"
+      "--wait"
+      "--collect"
+      "--service-type=exec"
+      "--property=EnvironmentFile=/etc/atticd.env"
+      "--property=DynamicUser=yes"
+      "--property=User=atticd"
+      "--property=StateDirectory=atticd"
+      "--working-directory=/"
+      "--"
+      "${serverPackage}/bin/atticd -f ${serverConfigFile}"
+    ];
   };
 
   makeTestDerivation = pkgs.writeShellScript "make-drv" ''
