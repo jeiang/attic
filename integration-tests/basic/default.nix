@@ -66,7 +66,13 @@ let
         '';
 
         services.atticd.settings = {
-          database.url = "postgresql:///attic?host=/run/postgresql";
+          # The username must be explicit: sqlx 0.9 no longer reliably
+          # derives it from the OS user (it falls back to whoami, which
+          # yields "anonymous" inside the hardened systemd unit), breaking
+          # peer authentication. The "localhost" authority is a placeholder
+          # required by URL parsing; the host query parameter overrides it
+          # with the Unix socket path.
+          database.url = "postgresql://atticd@localhost/attic?host=/run/postgresql";
         };
       };
       testScriptPost = ''
