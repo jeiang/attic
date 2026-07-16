@@ -224,8 +224,8 @@ in {
           client.succeed("attic cache create test")
 
       with subtest("Check cache listing authorization and ordering"):
-          assert client.succeed("attic cache list") == "test\\nzebra\\n"
-          assert client.succeed("attic cache list readonly") == "test\\n"
+          assert client.succeed("attic cache list") == "test\nzebra\n"
+          assert client.succeed("attic cache list readonly") == "test\n"
           assert client.succeed("attic cache list anon") == ""
 
       with subtest("Check that we can push a path"):
@@ -271,7 +271,7 @@ in {
           client.succeed("attic cache configure test --public")
           client.succeed("curl -sL --fail-with-body http://server:8080/test/nix-cache-info")
           client.succeed(f"curl -sL --fail-with-body http://server:8080/test/{test_file_hash}.narinfo")
-          assert client.succeed("attic cache list anon") == "test\\n"
+          assert client.succeed("attic cache list anon") == "test\n"
 
       with subtest("Check that we can trigger garbage collection"):
           test_file_hash = test_file.removeprefix("/nix/store/")[:32]
@@ -300,7 +300,7 @@ in {
           client.succeed("attic cache destroy --no-confirm test")
           client.fail("attic cache info test")
           client.fail("curl -sL --fail-with-body http://server:8080/test/nix-cache-info")
-          assert client.succeed("attic cache list") == "zebra\\n"
+          assert client.succeed("attic cache list") == "zebra\n"
           assert client.succeed("attic cache list anon") == ""
 
       ${databaseModules.${config.database}.testScriptPost or ""}
