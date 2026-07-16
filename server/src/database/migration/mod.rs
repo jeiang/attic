@@ -42,3 +42,52 @@ impl MigratorTrait for Migrator {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use sea_orm::SqlxSqliteConnector;
+    use sea_orm::sqlx::sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+    };
+
+    use super::{Migrator, MigratorTrait};
+
+    /// The full migration chain must succeed on a fresh file-backed SQLite
+    /// database, using the same connect options as `connect_sqlite` and the
+    /// single connection that `run_migrations` enforces. With more than one
+    /// pooled connection, consecutive migration statements can land on
+    /// different connections and observe stale schema state, failing
+    /// nondeterministically.
+    #[tokio::test]
+    async fn full_migration_chain_on_fresh_sqlite_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "attic-migration-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}/server.db?mode=rwc", dir.display());
+
+        let connect_options = SqliteConnectOptions::from_str(&url)
+            .unwrap()
+            .busy_timeout(Duration::from_secs(10))
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .pragma("temp_store", "memory");
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(connect_options)
+            .await
+            .unwrap();
+        let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+
+        Migrator::up(&db, None).await.unwrap();
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
