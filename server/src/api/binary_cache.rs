@@ -116,10 +116,9 @@ async fn get_nix_cache_info(
     Extension(req_state): Extension<RequestState>,
     Path(cache_name): Path<CacheName>,
 ) -> ServerResult<Response> {
-    let database = state.database().await?;
     let cache = req_state
         .auth
-        .auth_cache(database, &cache_name, |cache, permission| {
+        .auth_cache(&state, &cache_name, |cache, permission| {
             permission.require_pull()?;
             Ok(cache)
         })
@@ -190,7 +189,7 @@ async fn get_store_path_info(
     let mut narinfo = object.to_nar_info(&nar)?;
 
     if narinfo.signature().is_none() {
-        let keypair = cache.keypair()?;
+        let keypair = state.parse_keypair_cached(&cache.keypair)?;
         narinfo.sign(&keypair);
     }
 

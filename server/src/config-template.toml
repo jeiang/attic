@@ -55,6 +55,12 @@ allowed-hosts = []
 # cache.
 #require-proof-of-possession = true
 
+# How long cache metadata (the cache row: visibility, keypair, retention settings)
+# may be served from an in-memory cache before re-querying the database.
+# Mutations made through this server instance take effect immediately; the TTL only
+# bounds staleness across replicas. Set to "0s" to disable.
+#cache-metadata-ttl = "5s"
+
 # Database connection
 [database]
 # Connection URL

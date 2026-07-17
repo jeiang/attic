@@ -3,11 +3,10 @@
 use attic::cache::CacheName;
 use attic_token::util::parse_authorization_header;
 use axum::{extract::Request, middleware::Next, response::Response};
-use sea_orm::DatabaseConnection;
 use tokio::sync::OnceCell;
 
 use crate::access::{CachePermission, Token};
-use crate::database::{AtticDatabase, entity::cache::CacheModel};
+use crate::database::entity::cache::CacheModel;
 use crate::error::ServerResult;
 use crate::{RequestState, State};
 
@@ -42,7 +41,7 @@ impl AuthState {
     /// Finds and performs authorization for a cache.
     pub async fn auth_cache<F, T>(
         &self,
-        database: &DatabaseConnection,
+        state: &State,
         cache_name: &CacheName,
         f: F,
     ) -> ServerResult<T>
@@ -55,7 +54,7 @@ impl AuthState {
             CachePermission::default()
         };
 
-        let cache = match database.find_cache(cache_name).await {
+        let cache = match state.find_cache_cached(cache_name).await {
             Ok(d) => {
                 if d.is_public {
                     permission.add_public_permissions();

@@ -25,10 +25,12 @@ mod narinfo;
 pub mod nix_manifest;
 pub mod oobe;
 mod storage;
+mod ttl_cache;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -54,11 +56,15 @@ use uuid::Uuid;
 
 use access::http::{AuthState, apply_auth};
 use attic::cache::CacheName;
+use attic::signing::NixKeypair;
 use config::{Config, StorageConfig};
+use database::AtticDatabase;
+use database::entity::cache::CacheModel;
 use database::migration::{Migrator, MigratorTrait};
 use error::{ErrorKind, ServerError, ServerResult};
 use middleware::{assign_request_id, init_request_state, restrict_host, set_visibility_header};
 use storage::{LocalBackend, S3Backend, StorageBackendImpl};
+use ttl_cache::TtlCache;
 
 type State = Arc<StateInner>;
 type RequestState = Arc<RequestStateInner>;
@@ -83,7 +89,28 @@ pub struct StateInner {
 
     /// Cached JSON Web Key Sets for OIDC providers.
     oidc_keysets: Mutex<HashMap<String, CachedOidcKeyset>>,
+
+    /// TTL cache of cache metadata (the `cache` database row), keyed by
+    /// cache name.
+    ///
+    /// See `find_cache_cached` and `config.cache_metadata_ttl`.
+    cache_metadata: TtlCache<CacheName, CacheModel>,
+
+    /// Memoized parses of cache signing keypairs, keyed by the full
+    /// base64-exported keypair string.
+    ///
+    /// Unlike `cache_metadata`, this never expires: it's keyed by content,
+    /// not identity, so a rotated keypair simply gets a new key and can
+    /// never be served stale. See `parse_keypair_cached`.
+    parsed_keypairs: RwLock<HashMap<String, Arc<NixKeypair>>>,
 }
+
+/// Maximum number of entries kept in `StateInner::parsed_keypairs`.
+///
+/// This map is purely a memoization cache (entries never expire on their
+/// own), so it's cleared outright once it grows past this size to bound
+/// memory use in deployments where keypairs rotate frequently.
+const MAX_PARSED_KEYPAIRS: usize = 256;
 
 /// An OIDC JSON Web Key Set cached until its next refresh.
 #[derive(Debug)]
@@ -137,7 +164,74 @@ impl StateInner {
             upload_permits,
             chunk_upload_permits,
             oidc_keysets: Mutex::new(HashMap::new()),
+            cache_metadata: TtlCache::new(),
+            parsed_keypairs: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Returns cache metadata (the `cache` database row) for `cache_name`,
+    /// possibly served from the in-memory TTL cache.
+    ///
+    /// On a cache miss (`NoSuchCache`), nothing is cached: the error is
+    /// always immediate and reflects the current database state, since
+    /// caching a miss would mean pull/push permission errors could
+    /// temporarily "stick" after the cache is created.
+    async fn find_cache_cached(&self, cache_name: &CacheName) -> ServerResult<CacheModel> {
+        let ttl = self.config.cache_metadata_ttl;
+        if ttl.is_zero() {
+            return self.database().await?.find_cache(cache_name).await;
+        }
+
+        if let Some(cached) = self.cache_metadata.get(cache_name, ttl) {
+            return Ok(cached);
+        }
+
+        let cache = self.database().await?.find_cache(cache_name).await?;
+        self.cache_metadata
+            .insert(cache_name.clone(), cache.clone());
+        Ok(cache)
+    }
+
+    /// Evicts any cached metadata for `cache_name`.
+    ///
+    /// Called after any mutation (create/configure/destroy) so that changes
+    /// made through this server instance are visible immediately, even
+    /// though other replicas may still observe the old data for up to
+    /// `cache_metadata_ttl`.
+    fn invalidate_cache_metadata(&self, cache_name: &CacheName) {
+        // Harmless (and cheap) to call even when the TTL cache is disabled.
+        self.cache_metadata.invalidate(cache_name);
+    }
+
+    /// Returns a parsed keypair for `keypair_str`, memoized by the full
+    /// keypair string.
+    ///
+    /// This is keyed by content rather than by cache identity so that a
+    /// rotated keypair is guaranteed to get a fresh cache entry -- there's
+    /// no invalidation to forget, and no risk of ever handing out a stale
+    /// keypair for a cache whose keypair has changed.
+    fn parse_keypair_cached(&self, keypair_str: &str) -> ServerResult<Arc<NixKeypair>> {
+        if let Some(cached) = self
+            .parsed_keypairs
+            .read()
+            .expect("parsed_keypairs lock poisoned")
+            .get(keypair_str)
+        {
+            return Ok(cached.clone());
+        }
+
+        let parsed = Arc::new(keypair_str.parse::<NixKeypair>()?);
+
+        let mut keypairs = self
+            .parsed_keypairs
+            .write()
+            .expect("parsed_keypairs lock poisoned");
+        if keypairs.len() >= MAX_PARSED_KEYPAIRS {
+            keypairs.clear();
+        }
+        keypairs.insert(keypair_str.to_owned(), parsed.clone());
+
+        Ok(parsed)
     }
 
     /// Returns a handle to the database.
