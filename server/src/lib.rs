@@ -355,8 +355,16 @@ pub async fn run_api_server(
 }
 
 /// Runs database migrations.
-pub async fn run_migrations(config: Config) -> Result<()> {
+pub async fn run_migrations(mut config: Config) -> Result<()> {
     eprintln!("Running migrations...");
+
+    // Migrations must run on a single connection. With a multi-connection
+    // SQLite pool, consecutive migration statements can be executed on
+    // different pooled connections and observe stale schema state, making
+    // DDL-heavy migrations fail nondeterministically (e.g. "no such column"
+    // or "there is already another table or index with this name").
+    config.database.max_connections = Some(1);
+    config.database.min_connections = None;
 
     let state = StateInner::new(config).await;
     let db = state.database().await?;

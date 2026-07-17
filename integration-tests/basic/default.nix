@@ -3,10 +3,29 @@ let
   inherit (lib) types;
 
   serverConfigFile = config.nodes.server.services.atticd.configFile;
+  serverPackage = config.nodes.server.services.atticd.package;
 
   cmd = {
     atticadm = ". /etc/atticd.env && export ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64 && atticd-atticadm";
-    atticd = ". /etc/atticd.env && export ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64 && atticd -f ${serverConfigFile}";
+    # One-off atticd invocations (e.g. triggering GC) must run under the
+    # same dynamic user and state directory as the atticd service: the
+    # database URL names the "atticd" user explicitly, so a root-run
+    # invocation would fail postgres peer authentication.
+    atticd = lib.concatStringsSep " " [
+      "systemd-run"
+      "--quiet"
+      "--pipe"
+      "--wait"
+      "--collect"
+      "--service-type=exec"
+      "--property=EnvironmentFile=/etc/atticd.env"
+      "--property=DynamicUser=yes"
+      "--property=User=atticd"
+      "--property=StateDirectory=atticd"
+      "--working-directory=/"
+      "--"
+      "${serverPackage}/bin/atticd -f ${serverConfigFile}"
+    ];
   };
 
   makeTestDerivation = pkgs.writeShellScript "make-drv" ''
@@ -66,7 +85,13 @@ let
         '';
 
         services.atticd.settings = {
-          database.url = "postgresql:///attic?host=/run/postgresql";
+          # The username must be explicit: sqlx 0.9 no longer reliably
+          # derives it from the OS user (it falls back to whoami, which
+          # yields "anonymous" inside the hardened systemd unit), breaking
+          # peer authentication. The "localhost" authority is a placeholder
+          # required by URL parsing; the host query parameter overrides it
+          # with the Unix socket path.
+          database.url = "postgresql://atticd@localhost/attic?host=/run/postgresql";
         };
       };
       testScriptPost = ''
@@ -218,8 +243,8 @@ in {
           client.succeed("attic cache create test")
 
       with subtest("Check cache listing authorization and ordering"):
-          assert client.succeed("attic cache list") == "test\\nzebra\\n"
-          assert client.succeed("attic cache list readonly") == "test\\n"
+          assert client.succeed("attic cache list") == "test\nzebra\n"
+          assert client.succeed("attic cache list readonly") == "test\n"
           assert client.succeed("attic cache list anon") == ""
 
       with subtest("Check that we can push a path"):
@@ -265,7 +290,7 @@ in {
           client.succeed("attic cache configure test --public")
           client.succeed("curl -sL --fail-with-body http://server:8080/test/nix-cache-info")
           client.succeed(f"curl -sL --fail-with-body http://server:8080/test/{test_file_hash}.narinfo")
-          assert client.succeed("attic cache list anon") == "test\\n"
+          assert client.succeed("attic cache list anon") == "test\n"
 
       with subtest("Check that we can trigger garbage collection"):
           test_file_hash = test_file.removeprefix("/nix/store/")[:32]
@@ -294,7 +319,7 @@ in {
           client.succeed("attic cache destroy --no-confirm test")
           client.fail("attic cache info test")
           client.fail("curl -sL --fail-with-body http://server:8080/test/nix-cache-info")
-          assert client.succeed("attic cache list") == "zebra\\n"
+          assert client.succeed("attic cache list") == "zebra\n"
           assert client.succeed("attic cache list anon") == ""
 
       ${databaseModules.${config.database}.testScriptPost or ""}
