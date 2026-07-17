@@ -121,6 +121,14 @@ pub struct Config {
     #[serde(default = "default_max_concurrent_chunk_uploads")]
     pub max_concurrent_chunk_uploads: usize,
 
+    /// Number of chunks to prefetch from storage when reassembling a
+    /// multi-chunk NAR for download.
+    ///
+    /// Each prefetched chunk buffers at most `chunking.max-size` bytes.
+    #[serde(rename = "nar-reassembly-prefetch")]
+    #[serde(default = "default_nar_reassembly_prefetch")]
+    pub nar_reassembly_prefetch: usize,
+
     /// Database connection.
     pub database: DatabaseConfig,
 
@@ -507,6 +515,14 @@ pub struct GarbageCollectionConfig {
     #[serde(rename = "default-retention-period")]
     #[serde(with = "humantime_serde", default = "default_default_retention_period")]
     pub default_retention_period: Duration,
+
+    /// Maximum number of concurrent storage delete operations during garbage collection.
+    ///
+    /// This caps how many orphan chunks are deleted from remote storage
+    /// at the same time when reaping orphan chunks.
+    #[serde(rename = "storage-deletion-concurrency")]
+    #[serde(default = "default_gc_storage_deletion_concurrency")]
+    pub storage_deletion_concurrency: usize,
 }
 
 fn load_jwt_signing_config_from_env() -> JWTSigningConfig {
@@ -623,7 +639,7 @@ impl CompressionConfig {
 
         match self.r#type {
             CompressionType::Brotli => CompressionLevel::Precise(5),
-            CompressionType::Zstd => CompressionLevel::Precise(8),
+            CompressionType::Zstd => CompressionLevel::Precise(3),
             CompressionType::Xz => CompressionLevel::Precise(2),
             _ => CompressionLevel::Default,
         }
@@ -655,6 +671,7 @@ impl Default for GarbageCollectionConfig {
         Self {
             interval: Duration::from_secs(43200),
             default_retention_period: Duration::ZERO,
+            storage_deletion_concurrency: default_gc_storage_deletion_concurrency(),
         }
     }
 }
@@ -747,12 +764,20 @@ fn default_default_retention_period() -> Duration {
     Duration::ZERO
 }
 
+fn default_gc_storage_deletion_concurrency() -> usize {
+    20
+}
+
 fn default_max_nar_info_size() -> usize {
     1024 * 1024 // 1 MiB
 }
 
 fn default_max_concurrent_chunk_uploads() -> usize {
     10
+}
+
+fn default_nar_reassembly_prefetch() -> usize {
+    4
 }
 
 fn default_db_mmap_size() -> u64 {
@@ -800,7 +825,13 @@ fn validate_concurrency_config(config: &Config) -> Result<()> {
     validate_concurrency_values(
         config.max_concurrent_uploads,
         config.max_concurrent_chunk_uploads,
-    )
+    )?;
+    anyhow::ensure!(
+        config.garbage_collection.storage_deletion_concurrency > 0,
+        "garbage-collection.storage-deletion-concurrency must be greater than zero"
+    );
+    validate_nar_reassembly_prefetch_value(config.nar_reassembly_prefetch)?;
+    Ok(())
 }
 
 fn validate_concurrency_values(
@@ -814,6 +845,14 @@ fn validate_concurrency_values(
     anyhow::ensure!(
         max_concurrent_chunk_uploads > 0,
         "max-concurrent-chunk-uploads must be greater than zero"
+    );
+    Ok(())
+}
+
+fn validate_nar_reassembly_prefetch_value(nar_reassembly_prefetch: usize) -> Result<()> {
+    anyhow::ensure!(
+        nar_reassembly_prefetch > 0,
+        "nar-reassembly-prefetch must be greater than zero"
     );
     Ok(())
 }
@@ -888,7 +927,10 @@ fn validate_oidc_config(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod oidc_tests {
-    use super::{OidcClaimValue, validate_concurrency_values};
+    use super::{
+        OidcClaimValue, default_nar_reassembly_prefetch, validate_concurrency_values,
+        validate_nar_reassembly_prefetch_value,
+    };
     use serde_json::json;
 
     #[test]
@@ -905,6 +947,13 @@ mod oidc_tests {
         assert!(validate_concurrency_values(None, 10).is_ok());
         assert!(validate_concurrency_values(Some(0), 10).is_err());
         assert!(validate_concurrency_values(None, 0).is_err());
+    }
+
+    #[test]
+    fn nar_reassembly_prefetch_default_and_reject_zero() {
+        assert_eq!(default_nar_reassembly_prefetch(), 4);
+        assert!(validate_nar_reassembly_prefetch_value(4).is_ok());
+        assert!(validate_nar_reassembly_prefetch_value(0).is_err());
     }
 }
 

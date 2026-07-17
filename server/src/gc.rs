@@ -173,6 +173,9 @@ async fn run_reap_orphan_nars(state: &State) -> Result<()> {
 async fn run_reap_orphan_chunks(state: &State) -> Result<()> {
     let db = state.database().await?;
     let storage = state.storage().await?;
+    let delete_limit = Arc::new(Semaphore::new(
+        state.config.garbage_collection.storage_deletion_concurrency,
+    ));
 
     let database_backend = db.get_database_backend();
     let orphan_chunk_limit = match database_backend {
@@ -248,7 +251,6 @@ async fn run_reap_orphan_chunks(state: &State) -> Result<()> {
         let batch_len = orphan_chunks.len() as u64;
 
         // Delete the chunks from remote storage
-        let delete_limit = Arc::new(Semaphore::new(20)); // TODO: Make this configurable
         let futures: Vec<_> = orphan_chunks
             .into_iter()
             .map(|chunk| {

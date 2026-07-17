@@ -55,6 +55,15 @@ use crate::database::{AtticDatabase, ChunkGuard, NarGuard};
 /// TODO: Make this configurable
 const CONCURRENT_CHUNK_UPLOADS: usize = 10;
 
+/// Maximum number of chunkref rows to insert per statement.
+///
+/// `chunkref` inserts are batched at the end of a chunked upload (see
+/// `upload_path_new_chunked`) rather than issued one at a time per chunk.
+/// 1000 rows keeps the bind-parameter count (4 per row) comfortably under
+/// every supported backend's limit; see the similar batching rationale in
+/// `gc::run_reap_orphan_chunks`.
+const CHUNKREF_INSERT_BATCH_SIZE: usize = 1000;
+
 /// Data of a chunk.
 enum ChunkData {
     /// Some bytes in memory.
@@ -468,18 +477,12 @@ async fn upload_path_new_chunked(
                 )
                 .await?;
 
-                // Create mapping from the NAR to the chunk
-                ChunkRef::insert(chunkref::ActiveModel {
-                    nar_id: Set(nar_id),
-                    seq: Set(chunk_idx),
-                    chunk_id: Set(Some(chunk.guard.id)),
-                    ..Default::default()
-                })
-                .exec(&database)
-                .await
-                .map_err(ServerError::database_error)?;
-
-                Ok::<UploadChunkResult, ServerError>(chunk)
+                // The NAR-to-chunk mapping (`chunkref`) is not written here.
+                // Chunks complete out of order and are only meaningful once
+                // the NAR itself is marked `Valid`, so all chunkrefs for
+                // this upload are batch-inserted together in the final
+                // transaction below.
+                Ok::<(i32, UploadChunkResult), ServerError>((chunk_idx, chunk))
             }
         });
 
@@ -502,13 +505,17 @@ async fn upload_path_new_chunked(
     while let Some(chunk) = uploads.next().await {
         uploaded_chunks.push(chunk?);
     }
-    let chunks = uploaded_chunks;
+    let mut chunks = uploaded_chunks;
+    // Futures complete out of order; sort by the original chunk index for
+    // insert locality when writing chunkrefs below. Not required for
+    // correctness since each row carries its own `seq`.
+    chunks.sort_unstable_by_key(|(idx, _)| *idx);
     span.record("chunk_count", chunks.len());
 
     let (file_size, deduplicated_size) =
         chunks
             .iter()
-            .fold((0, 0), |(file_size, deduplicated_size), c| {
+            .fold((0, 0), |(file_size, deduplicated_size), (_idx, c)| {
                 (
                     file_size + c.guard.file_size.unwrap() as usize,
                     if c.deduplicated {
@@ -535,6 +542,27 @@ async fn upload_path_new_chunked(
     .exec(&txn)
     .await
     .map_err(ServerError::database_error)?;
+
+    // Create the NAR-to-chunk mappings. These are only meaningful once the
+    // NAR is `Valid` (see above), so they're deferred from the per-chunk
+    // upload futures to here and inserted in batches, rather than one
+    // `chunkref` row per statement, to cut down on DB round-trips.
+    let chunkref_models: Vec<chunkref::ActiveModel> = chunks
+        .iter()
+        .map(|(idx, chunk)| chunkref::ActiveModel {
+            nar_id: Set(nar_id),
+            seq: Set(*idx),
+            chunk_id: Set(Some(chunk.guard.id)),
+            ..Default::default()
+        })
+        .collect();
+
+    for batch in chunkref_models.chunks(CHUNKREF_INSERT_BATCH_SIZE) {
+        ChunkRef::insert_many(batch.to_vec())
+            .exec(&txn)
+            .await
+            .map_err(ServerError::database_error)?;
+    }
 
     // Create a mapping granting the local cache access to the NAR
     Object::insert({
@@ -676,8 +704,34 @@ async fn upload_chunk(
     let chunk_started = Instant::now();
     let compression: Compression = compression_type.into();
 
-    let given_chunk_hash = data.hash();
-    let given_chunk_size = data.size();
+    // For `ChunkData::Bytes`, the data is an immutable in-memory buffer that
+    // the server itself produced (e.g. from chunking the incoming NAR
+    // stream), so its hash is trustworthy. We compute it once here (off the
+    // async executor, since hashing is CPU-bound) and reuse it below to skip
+    // the otherwise-redundant NAR-hash pass inside `CompressionStream`.
+    //
+    // For `ChunkData::Stream`, the hash is client-claimed and potentially
+    // incorrect, so it cannot be precomputed - it's verified in-pipeline
+    // instead.
+    let (given_chunk_hash, given_chunk_size, precomputed_nar_hash) = match &data {
+        ChunkData::Bytes(bytes) => {
+            let bytes = bytes.clone();
+            let size = bytes.len();
+
+            let digest = tokio::task::spawn_blocking(move || {
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                hasher.finalize()
+            })
+            .await
+            .map_err(|_| ErrorKind::InternalServerError)?;
+
+            let hash = Hash::Sha256((&digest[..]).try_into().unwrap());
+
+            (hash, size, Some((digest, size)))
+        }
+        ChunkData::Stream(_, hash, size) => (hash.clone(), *size, None),
+    };
 
     let lookup_started = Instant::now();
     let existing_chunk = match database
@@ -808,8 +862,20 @@ async fn upload_chunk(
     });
 
     // Compress and stream to the storage backend
-    let compressor = get_compressor_fn(compression_type, compression_level);
-    let mut stream = CompressionStream::new(data.into_async_buf_read(), compressor);
+    let mut stream = match precomputed_nar_hash {
+        Some(pre) => {
+            let compressor = get_compressor_fn(compression_type, compression_level);
+            CompressionStream::with_precomputed_nar_hash(
+                data.into_async_buf_read(),
+                compressor,
+                pre,
+            )
+        }
+        None => {
+            let compressor = get_compressor_fn(compression_type, compression_level);
+            CompressionStream::new(data.into_async_buf_read(), compressor)
+        }
+    };
 
     let storage_started = Instant::now();
     backend
@@ -897,27 +963,6 @@ fn get_compressor_fn<C: AsyncBufRead + Unpin + Send + 'static>(
 }
 
 impl ChunkData {
-    /// Returns the potentially-incorrect hash of the chunk.
-    fn hash(&self) -> Hash {
-        match self {
-            Self::Bytes(bytes) => {
-                let mut hasher = Sha256::new();
-                hasher.update(bytes);
-                let hash = hasher.finalize();
-                Hash::Sha256((&hash[..]).try_into().unwrap())
-            }
-            Self::Stream(_, hash, _) => hash.clone(),
-        }
-    }
-
-    /// Returns the potentially-incorrect size of the chunk.
-    fn size(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => bytes.len(),
-            Self::Stream(_, _, size) => *size,
-        }
-    }
-
     /// Returns whether the hash is trusted.
     fn is_hash_trusted(&self) -> bool {
         matches!(self, ChunkData::Bytes(_))

@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
+use chrono::{DateTime, Utc};
 use futures::TryStreamExt as _;
 use futures::stream::BoxStream;
 use serde::Serialize;
@@ -27,7 +28,6 @@ use tracing::instrument;
 use crate::database::AtticDatabase;
 use crate::database::entity::chunk::ChunkModel;
 use crate::error::{ErrorKind, ServerResult};
-use crate::narinfo::NarInfo;
 use crate::nix_manifest;
 use crate::storage::{Download, StorageBackend, StorageBackendImpl};
 use crate::{RequestState, State};
@@ -35,6 +35,38 @@ use attic::cache::CacheName;
 use attic::io::merge_chunks;
 use attic::mime;
 use attic::nix_store::StorePathHash;
+
+/// Buffer size for `ReaderStream`, whose 4 KiB default is too small for streaming multi-MiB NARs.
+const STREAM_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Builds a `Cache-Control` header value.
+///
+/// `is_public` controls the cacheability directive: `public` caches (shared
+/// HTTP caches, CDNs) may store responses for public Attic caches, while
+/// `private` responses must only be cached by the requesting client since
+/// they require an auth token to fetch. `immutable` should be set for
+/// content-addressed payloads (NARs) that never change once fetched.
+fn cache_control(is_public: bool, max_age_secs: u64, immutable: bool) -> http::HeaderValue {
+    let visibility = if is_public { "public" } else { "private" };
+
+    let value = if immutable {
+        format!("{visibility}, max-age={max_age_secs}, immutable")
+    } else {
+        format!("{visibility}, max-age={max_age_secs}")
+    };
+
+    http::HeaderValue::from_str(&value).expect("Cache-Control value must be a valid header value")
+}
+
+/// How often `last_accessed_at` is allowed to be bumped for a given object.
+///
+/// The timestamp only feeds retention-based garbage collection, which
+/// compares it against cutoffs measured in hours to days (see
+/// `run_time_based_garbage_collection` in `gc.rs`). Bumps within this
+/// window are therefore skipped: the extra precision has no observable
+/// effect on GC decisions, but re-bumping on every single download would
+/// put a database write on the critical path of every NAR fetch.
+const LAST_ACCESSED_DEBOUNCE: chrono::Duration = chrono::Duration::hours(1);
 
 /// Nix cache information.
 ///
@@ -83,7 +115,7 @@ async fn get_nix_cache_info(
     Extension(state): Extension<State>,
     Extension(req_state): Extension<RequestState>,
     Path(cache_name): Path<CacheName>,
-) -> ServerResult<NixCacheInfo> {
+) -> ServerResult<Response> {
     let database = state.database().await?;
     let cache = req_state
         .auth
@@ -101,7 +133,13 @@ async fn get_nix_cache_info(
         priority: cache.priority,
     };
 
-    Ok(info)
+    let mut response = info.into_response();
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        cache_control(cache.is_public, 300, false),
+    );
+
+    Ok(response)
 }
 
 /// Gets various information on a store path hash.
@@ -116,7 +154,7 @@ async fn get_store_path_info(
     Extension(state): Extension<State>,
     Extension(req_state): Extension<RequestState>,
     Path((cache_name, path)): Path<(CacheName, String)>,
-) -> ServerResult<NarInfo> {
+) -> ServerResult<Response> {
     let components: Vec<&str> = path.splitn(2, '.').collect();
 
     if components.len() != 2 {
@@ -156,7 +194,24 @@ async fn get_store_path_info(
         narinfo.sign(&keypair);
     }
 
-    Ok(narinfo)
+    let mut response = narinfo.into_response();
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        cache_control(cache.is_public, 300, false),
+    );
+
+    Ok(response)
+}
+
+/// Returns whether an object's `last_accessed_at` timestamp is due for a bump.
+///
+/// A bump is needed when the object has never been accessed, or when the
+/// last recorded access is older than [`LAST_ACCESSED_DEBOUNCE`].
+fn should_bump_last_accessed(last_accessed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last_accessed_at {
+        None => true,
+        Some(last_accessed_at) => now - last_accessed_at >= LAST_ACCESSED_DEBOUNCE,
+    }
 }
 
 /// Gets a NAR.
@@ -209,7 +264,21 @@ async fn get_nar(
         return Err(ErrorKind::IncompleteNar.into());
     }
 
-    database.bump_object_last_accessed(object.id).await?;
+    if should_bump_last_accessed(object.last_accessed_at, Utc::now()) {
+        // The timestamp only feeds retention-based GC (hours-to-days
+        // granularity), so we don't need to await this write or fail the
+        // request if it errors out. Spawning it off the request path avoids
+        // putting a database round-trip in front of every NAR download,
+        // which would otherwise serialize concurrent downloads through
+        // SQLite's single writer.
+        let database = database.clone();
+        let object_id = object.id;
+        tokio::spawn(async move {
+            if let Err(e) = database.bump_object_last_accessed(object_id).await {
+                tracing::warn!(%e, "Failed to bump last_accessed_at for object {}", object_id);
+            }
+        });
+    }
 
     if chunks.len() == 1 {
         // single chunk
@@ -217,19 +286,33 @@ async fn get_nar(
         let remote_file = &chunk.remote_file.0;
         let storage = state.storage().await?;
         match storage.download_file_db(remote_file, false).await? {
-            Download::Url(url) => Ok(Redirect::temporary(&url).into_response()),
+            Download::Url(url) => {
+                let mut response = Redirect::temporary(&url).into_response();
+                response.headers_mut().insert(
+                    http::header::CACHE_CONTROL,
+                    cache_control(cache.is_public, 60, false),
+                );
+
+                Ok(response)
+            }
             Download::AsyncRead(stream) => {
-                let stream = ReaderStream::new(stream).map_err(|e| {
+                let stream = ReaderStream::with_capacity(stream, STREAM_BUFFER_SIZE).map_err(|e| {
                     tracing::error!(%e, "Stream error");
                     e
                 });
                 let body = Body::from_stream(stream);
 
                 Ok((
-                    [(
-                        http::header::CONTENT_TYPE,
-                        http::HeaderValue::from_static(mime::NAR),
-                    )],
+                    [
+                        (
+                            http::header::CONTENT_TYPE,
+                            http::HeaderValue::from_static(mime::NAR),
+                        ),
+                        (
+                            http::header::CACHE_CONTROL,
+                            cache_control(cache.is_public, 31_536_000, true),
+                        ),
+                    ],
                     body,
                 )
                     .into_response())
@@ -249,7 +332,8 @@ async fn get_nar(
             {
                 Download::Url(_) => Err(IoError::other("URLs not supported for NAR reassembly")),
                 Download::AsyncRead(stream) => {
-                    let stream: BoxStream<_> = Box::pin(ReaderStream::new(stream));
+                    let stream: BoxStream<_> =
+                        Box::pin(ReaderStream::with_capacity(stream, STREAM_BUFFER_SIZE));
                     Ok(stream)
                 }
             }
@@ -258,19 +342,24 @@ async fn get_nar(
         let chunks: VecDeque<_> = chunks.into_iter().map(Option::unwrap).collect();
         let storage = state.storage().await?.clone();
 
-        // TODO: Make num_prefetch configurable
-        // The ideal size depends on the average chunk size
-        let merged = merge_chunks(chunks, streamer, storage, 2).map_err(|e| {
+        let num_prefetch = state.config.nar_reassembly_prefetch;
+        let merged = merge_chunks(chunks, streamer, storage, num_prefetch).map_err(|e| {
             tracing::error!(%e, "Stream error");
             e
         });
         let body = Body::from_stream(merged);
 
         Ok((
-            [(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static(mime::NAR),
-            )],
+            [
+                (
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static(mime::NAR),
+                ),
+                (
+                    http::header::CACHE_CONTROL,
+                    cache_control(cache.is_public, 31_536_000, true),
+                ),
+            ],
             body,
         )
             .into_response())
@@ -282,4 +371,41 @@ pub fn get_router() -> Router {
         .route("/{cache}/nix-cache-info", get(get_nix_cache_info))
         .route("/{cache}/{path}", get(get_store_path_info))
         .route("/{cache}/nar/{path}", get(get_nar))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_bump_last_accessed_none_is_true() {
+        let now = Utc::now();
+        assert!(should_bump_last_accessed(None, now));
+    }
+
+    #[test]
+    fn should_bump_last_accessed_stale_is_true() {
+        let now = Utc::now();
+        let two_hours_ago = now - chrono::Duration::hours(2);
+        assert!(should_bump_last_accessed(Some(two_hours_ago), now));
+    }
+
+    #[test]
+    fn should_bump_last_accessed_recent_is_false() {
+        let now = Utc::now();
+        let one_minute_ago = now - chrono::Duration::minutes(1);
+        assert!(!should_bump_last_accessed(Some(one_minute_ago), now));
+    }
+
+    #[test]
+    fn cache_control_public_immutable() {
+        let value = cache_control(true, 31_536_000, true);
+        assert_eq!(value, "public, max-age=31536000, immutable");
+    }
+
+    #[test]
+    fn cache_control_private_not_immutable() {
+        let value = cache_control(false, 300, false);
+        assert_eq!(value, "private, max-age=300");
+    }
 }
