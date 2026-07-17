@@ -129,6 +129,23 @@ pub struct Config {
     #[serde(default = "default_nar_reassembly_prefetch")]
     pub nar_reassembly_prefetch: usize,
 
+    /// How long cache metadata (the cache row) may be served from an
+    /// in-memory cache before re-querying the database.
+    ///
+    /// This bounds the staleness of visibility/permission-relevant settings
+    /// (e.g. `is_public`, the signing keypair) when running multiple
+    /// replicas against a shared database: a mutation made on another node
+    /// may take up to this long to be observed here. Mutations made through
+    /// this server instance take effect immediately regardless of this
+    /// setting, since the in-memory entry is invalidated on write.
+    ///
+    /// A value of zero disables the cache (every request re-queries the
+    /// database).
+    #[serde(rename = "cache-metadata-ttl")]
+    #[serde(with = "humantime_serde")]
+    #[serde(default = "default_cache_metadata_ttl")]
+    pub cache_metadata_ttl: Duration,
+
     /// Database connection.
     pub database: DatabaseConfig,
 
@@ -778,6 +795,10 @@ fn default_max_concurrent_chunk_uploads() -> usize {
 
 fn default_nar_reassembly_prefetch() -> usize {
     4
+}
+
+fn default_cache_metadata_ttl() -> Duration {
+    Duration::from_secs(5)
 }
 
 fn default_db_mmap_size() -> u64 {

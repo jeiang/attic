@@ -55,16 +55,17 @@ pub(crate) async fn get_cache_config(
     Extension(req_state): Extension<RequestState>,
     Path(cache_name): Path<CacheName>,
 ) -> ServerResult<Json<CacheConfig>> {
-    let database = state.database().await?;
     let cache = req_state
         .auth
-        .auth_cache(database, &cache_name, |cache, permission| {
+        .auth_cache(&state, &cache_name, |cache, permission| {
             permission.require_pull()?;
             Ok(cache)
         })
         .await?;
 
-    let public_key = cache.keypair()?.export_public_key();
+    let public_key = state
+        .parse_keypair_cached(&cache.keypair)?
+        .export_public_key();
 
     let retention_period_config = if let Some(period) = cache.retention_period {
         RetentionPeriodConfig::Period(period as u32)
@@ -95,7 +96,7 @@ pub(crate) async fn configure_cache(
     let database = state.database().await?;
     let (cache, permission) = req_state
         .auth
-        .auth_cache(database, &cache_name, |cache, permission| {
+        .auth_cache(&state, &cache_name, |cache, permission| {
             permission.require_configure_cache()?;
             Ok((cache, permission.clone()))
         })
@@ -161,6 +162,8 @@ pub(crate) async fn configure_cache(
             .await
             .map_err(ServerError::database_error)?;
 
+        state.invalidate_cache_metadata(&cache_name);
+
         Ok(())
     } else {
         Err(ErrorKind::RequestError(anyhow!("No modifiable fields were set.")).into())
@@ -176,7 +179,7 @@ pub(crate) async fn destroy_cache(
     let database = state.database().await?;
     let cache = req_state
         .auth
-        .auth_cache(database, &cache_name, |cache, permission| {
+        .auth_cache(&state, &cache_name, |cache, permission| {
             permission.require_destroy_cache()?;
             Ok(cache)
         })
@@ -192,6 +195,8 @@ pub(crate) async fn destroy_cache(
             .await
             .map_err(ServerError::database_error)?;
 
+        state.invalidate_cache_metadata(&cache_name);
+
         if deletion.rows_affected == 0 {
             // Someone raced to (soft) delete the cache before us
             Err(ErrorKind::NoSuchCache.into())
@@ -206,6 +211,8 @@ pub(crate) async fn destroy_cache(
             .exec(database)
             .await
             .map_err(ServerError::database_error)?;
+
+        state.invalidate_cache_metadata(&cache_name);
 
         if deletion.rows_affected == 0 {
             // Someone raced to (soft) delete the cache before us
@@ -256,6 +263,11 @@ pub(crate) async fn create_cache(
         // The cache already exists
         Err(ErrorKind::CacheAlreadyExists.into())
     } else {
+        // In case a previous, now-deleted cache of the same name (possible
+        // when soft-delete-caches is disabled, or the row was hard-deleted
+        // out-of-band) left behind a stale entry.
+        state.invalidate_cache_metadata(&cache_name);
+
         Ok(())
     }
 }

@@ -233,7 +233,7 @@ async fn upload_path_inner(
     let database = state.database().await?;
     let cache = req_state
         .auth
-        .auth_cache(database, cache_name, |cache, permission| {
+        .auth_cache(&state, cache_name, |cache, permission| {
             permission.require_push()?;
             Ok(cache)
         })
