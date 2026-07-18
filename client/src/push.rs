@@ -24,19 +24,26 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use async_channel as channel;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use futures::future::join_all;
-use futures::stream::{Stream, TryStreamExt};
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, spawn};
 use tokio::time;
 
-use crate::api::ApiClient;
-use attic::api::v1::cache_config::CacheConfig;
-use attic::api::v1::upload_path::{UploadPathNarInfo, UploadPathResult, UploadPathResultKind};
+use crate::api::{ApiClient, UploadAttempt};
+use attic::api::v1::cache_config::{CacheConfig, ChunkingParameters};
+use attic::api::v1::upload_path::{
+    ChunkManifestEntry, UploadPathNarInfo, UploadPathResult, UploadPathResultKind,
+    build_chunk_manifest,
+};
 use attic::cache::CacheName;
-use attic::error::AtticResult;
+use attic::chunking::chunk_stream;
+use attic::error::{AtticError, AtticResult};
+use attic::hash::Hash;
+use attic::io::read_chunk_async;
 use attic::nix_store::{NixStore, StorePath, StorePathHash, ValidPathInfo};
 
 type JobSender = channel::Sender<ValidPathInfo>;
@@ -71,7 +78,7 @@ pub struct Pusher {
     api: ApiClient,
     store: Arc<NixStore>,
     cache: CacheName,
-    cache_config: CacheConfig,
+    cache_config: Arc<CacheConfig>,
     workers: Vec<JoinHandle<HashMap<StorePath, Result<()>>>>,
     sender: JobSender,
 }
@@ -150,6 +157,7 @@ impl Pusher {
         mp: MultiProgress,
         config: PushConfig,
     ) -> Self {
+        let cache_config = Arc::new(cache_config);
         let (sender, receiver) = channel::unbounded();
         let mut workers = Vec::new();
 
@@ -159,6 +167,7 @@ impl Pusher {
                 store.clone(),
                 api.clone(),
                 cache.clone(),
+                cache_config.clone(),
                 mp.clone(),
                 config,
             )));
@@ -228,6 +237,7 @@ impl Pusher {
         store: Arc<NixStore>,
         api: ApiClient,
         cache: CacheName,
+        cache_config: Arc<CacheConfig>,
         mp: MultiProgress,
         config: PushConfig,
     ) -> HashMap<StorePath, Result<()>> {
@@ -249,6 +259,7 @@ impl Pusher {
                 store.clone(),
                 api.clone(),
                 &cache,
+                &cache_config,
                 mp.clone(),
                 config.force_preamble,
             )
@@ -499,39 +510,50 @@ pub async fn upload_path(
     store: Arc<NixStore>,
     api: ApiClient,
     cache: &CacheName,
+    cache_config: &CacheConfig,
     mp: MultiProgress,
     force_preamble: bool,
 ) -> Result<()> {
     let path = &path_info.path;
-    let upload_info = {
-        let full_path = store
-            .get_full_path(path)
-            .to_str()
-            .ok_or_else(|| anyhow!("Path contains non-UTF-8"))?
-            .to_string();
+    let nar_size = path_info.nar_size as usize;
 
-        let references = path_info
-            .references
-            .into_iter()
-            .map(|pb| {
-                pb.to_str()
-                    .ok_or_else(|| anyhow!("Reference contains non-UTF-8"))
-                    .map(|s| s.to_owned())
-            })
-            .collect::<Result<Vec<String>, anyhow::Error>>()?;
+    let full_path = store
+        .get_full_path(path)
+        .to_str()
+        .ok_or_else(|| anyhow!("Path contains non-UTF-8"))?
+        .to_string();
 
-        UploadPathNarInfo {
-            cache: cache.to_owned(),
-            store_path_hash: path.to_hash(),
-            store_path: full_path,
-            references,
-            system: None,  // TODO
-            deriver: None, // TODO
-            sigs: path_info.sigs,
-            ca: path_info.ca,
-            nar_hash: path_info.nar_hash.to_owned(),
-            nar_size: path_info.nar_size as usize,
-        }
+    let references = path_info
+        .references
+        .iter()
+        .map(|pb| {
+            pb.to_str()
+                .ok_or_else(|| anyhow!("Reference contains non-UTF-8"))
+                .map(|s| s.to_owned())
+        })
+        .collect::<Result<Vec<String>, anyhow::Error>>()?;
+
+    let store_path_hash = path.to_hash();
+    let sigs = path_info.sigs.clone();
+    let ca = path_info.ca.clone();
+    let nar_hash = path_info.nar_hash.clone();
+
+    // Builds the upload info for either a negotiated (with a chunk
+    // manifest) or a plain (full-upload) attempt. Cloning the small bits of
+    // metadata here is cheap and lets us prepare both request variants up
+    // front, since only one of them will ever have its body streamed.
+    let build_upload_info = |chunk_manifest: Option<Vec<ChunkManifestEntry>>| UploadPathNarInfo {
+        cache: cache.to_owned(),
+        store_path_hash: store_path_hash.clone(),
+        store_path: full_path.clone(),
+        references: references.clone(),
+        system: None,  // TODO
+        deriver: None, // TODO
+        sigs: sigs.clone(),
+        ca: ca.clone(),
+        nar_hash: nar_hash.clone(),
+        nar_size,
+        chunk_manifest,
     };
 
     let template = format!(
@@ -558,20 +580,96 @@ pub async fn upload_path(
         );
     let bar = mp.add(ProgressBar::new(path_info.nar_size));
     bar.set_style(style);
-    let request = api.prepare_upload_path(upload_info, force_preamble)?;
+
+    // Negotiate a chunk manifest iff the server advertises chunking
+    // parameters and this NAR is large enough to trigger chunking
+    // server-side. A threshold of 0 disables chunking server-side (and the
+    // server won't advertise `chunking` in that case), but we keep this
+    // check client-side too for extra safety.
+    let negotiated = match cache_config.chunking.as_ref() {
+        Some(chunking) if nar_size >= chunking.nar_size_threshold => {
+            match negotiate_chunk_manifest(&store, path, chunking, &api, cache).await {
+                Ok(negotiated) => negotiated,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "Chunk-manifest negotiation failed; falling back to full upload"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // The manifest can be too large for a header, so negotiated uploads
+    // always use the preamble.
+    let negotiated_request = negotiated
+        .as_ref()
+        .map(|n: &NegotiatedManifest| {
+            api.prepare_upload_path(
+                build_upload_info(Some(n.manifest.clone())),
+                true,
+                n.total_inline_bytes,
+            )
+        })
+        .transpose()?;
+    let full_request =
+        api.prepare_upload_path(build_upload_info(None), force_preamble, nar_size)?;
 
     let start = Instant::now();
-    match api
-        .upload_path_with_retry(|attempt| {
+
+    // Attempt 1 is the negotiated upload, if any; any subsequent attempt
+    // (including the only attempt when there's no negotiated manifest) is a
+    // full, non-negotiated upload. A negotiated attempt that fails for any
+    // reason (a race with GC, a manifest too large for the server, etc.)
+    // falls back to the full-upload path immediately, without consuming one
+    // of `upload_path_with_retry`'s retry attempts - a server that doesn't
+    // understand chunk manifests never receives one in the first place
+    // (negotiation is capability-gated on `cache_config.chunking`), so this
+    // fallback exists purely for negotiated-specific failures.
+    let mut negotiated_outcome = None;
+    if let Some(n) = &negotiated {
+        bar.set_position(0);
+        bar.set_length(n.total_inline_bytes as u64);
+        tracing::debug!("Starting negotiated (chunk-manifest) path upload attempt");
+
+        let raw_stream = store.nar_from_path(path.to_owned());
+        let adapted = negotiated_send_stream(raw_stream, n.manifest.clone());
+        let nar_stream = NarStreamProgress::new(adapted, bar.clone()).map_ok(Bytes::from);
+        let request = negotiated_request
+            .as_ref()
+            .expect("negotiated_request is set whenever negotiated is Some");
+
+        match api.upload_path_attempt(request, nar_stream).await {
+            Ok(value) => negotiated_outcome = Some(Ok(UploadAttempt { value, attempts: 1 })),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Negotiated upload attempt failed; falling back to full upload"
+                );
+            }
+        }
+    }
+
+    let upload_result = match negotiated_outcome {
+        Some(result) => result,
+        None => {
             bar.set_position(0);
-            tracing::debug!(attempt, "Starting path upload attempt");
-            let nar_stream =
-                NarStreamProgress::new(store.nar_from_path(path.to_owned()), bar.clone())
-                    .map_ok(Bytes::from);
-            api.upload_path_attempt(&request, nar_stream)
-        })
-        .await
-    {
+            bar.set_length(path_info.nar_size);
+            api.upload_path_with_retry(|attempt| {
+                bar.set_position(0);
+                tracing::debug!(attempt, "Starting path upload attempt");
+                let nar_stream =
+                    NarStreamProgress::new(store.nar_from_path(path.to_owned()), bar.clone())
+                        .map_ok(Bytes::from);
+                api.upload_path_attempt(&full_request, nar_stream)
+            })
+            .await
+        }
+    };
+
+    match upload_result {
         Ok(upload) => {
             let r = upload.value.unwrap_or(UploadPathResult {
                 kind: UploadPathResultKind::Uploaded,
@@ -615,6 +713,209 @@ pub async fn upload_path(
             });
             bar.finish_and_clear();
             Err(e.into())
+        }
+    }
+}
+
+/// A chunk manifest negotiated with the server, ready to send.
+struct NegotiatedManifest {
+    /// The manifest, in NAR stream order.
+    manifest: Vec<ChunkManifestEntry>,
+
+    /// The total size, in bytes, of the manifest's `inline` entries.
+    ///
+    /// This is the size of the request body a negotiated upload will
+    /// actually send, used both for `Content-Length` and to size the
+    /// progress bar.
+    total_inline_bytes: usize,
+}
+
+/// Attempts client-side chunk-manifest negotiation for a NAR upload.
+///
+/// This runs the same content-defined chunking algorithm the server uses
+/// (with the server-advertised parameters) over the NAR in a first "hash
+/// pass" that discards each chunk's bytes as soon as it's hashed, then asks
+/// the server (via `get-missing-chunks`) which of those chunks it already
+/// has.
+///
+/// Returns `Ok(None)` when negotiating would provide no benefit: the NAR
+/// produced no chunks, or every unique chunk is missing server-side (in
+/// which case a manifest would end up with everything inline, which is
+/// pure overhead compared to a plain full upload). The caller should treat
+/// this the same as "no manifest", not as a failure.
+///
+/// Returns `Err` if negotiation itself failed (e.g. the `get-missing-chunks`
+/// call errored). The caller should fall back to a full upload without
+/// treating this as a consumed retry attempt.
+async fn negotiate_chunk_manifest(
+    store: &Arc<NixStore>,
+    path: &StorePath,
+    chunking: &ChunkingParameters,
+    api: &ApiClient,
+    cache: &CacheName,
+) -> Result<Option<NegotiatedManifest>> {
+    let raw_stream = store.nar_from_path(path.to_owned());
+    let reader = StreamAsyncReader::new(raw_stream);
+    let mut chunks = chunk_stream(
+        reader,
+        chunking.min_size,
+        chunking.avg_size,
+        chunking.max_size,
+    );
+
+    let mut ordered_chunks: Vec<(Hash, usize)> = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        let hash = Hash::sha256_from_bytes(&chunk);
+        ordered_chunks.push((hash, chunk.len()));
+    }
+
+    if ordered_chunks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut seen = HashSet::new();
+    let mut unique_hashes = Vec::new();
+    for (hash, _) in &ordered_chunks {
+        if seen.insert(hash.clone()) {
+            unique_hashes.push(hash.clone());
+        }
+    }
+
+    let response = api.get_missing_chunks(cache, unique_hashes.clone()).await?;
+    let missing: HashSet<Hash> = response.missing_chunks.into_iter().collect();
+
+    if unique_hashes.iter().all(|hash| missing.contains(hash)) {
+        // Every unique chunk is missing server-side: a manifest would
+        // inline everything, which is pure overhead over a full upload.
+        return Ok(None);
+    }
+
+    let manifest = build_chunk_manifest(&ordered_chunks, &missing);
+    let total_inline_bytes = manifest
+        .iter()
+        .filter(|entry| entry.inline)
+        .map(|entry| entry.size)
+        .sum();
+
+    Ok(Some(NegotiatedManifest {
+        manifest,
+        total_inline_bytes,
+    }))
+}
+
+/// Re-streams a NAR, re-sliced according to a chunk manifest's recorded
+/// entry sizes, yielding only the bytes of `inline` entries in order.
+///
+/// The manifest's chunk boundaries were computed by `chunk_stream` in
+/// `negotiate_chunk_manifest`'s hash pass and generally don't line up with
+/// the arbitrary-sized reads the underlying byte stream happens to
+/// produce, so this re-slices by byte count (via `read_chunk_async`)
+/// rather than reusing the stream's own chunk boundaries. NAR serialization
+/// is deterministic, so re-running `NixStore::nar_from_path` on the same
+/// path reproduces the exact same bytes the hash pass saw.
+fn negotiated_send_stream<S>(
+    raw_stream: S,
+    manifest: Vec<ChunkManifestEntry>,
+) -> Pin<Box<dyn Stream<Item = AtticResult<Vec<u8>>> + Send + Sync>>
+where
+    S: Stream<Item = AtticResult<Vec<u8>>> + Unpin + Send + Sync + 'static,
+{
+    let reader = StreamAsyncReader::new(raw_stream);
+
+    // Boxed and pinned because the state machine `stream::unfold` builds
+    // around our `async move` closure is not itself `Unpin`, but
+    // `NarStreamProgress`/`upload_path_attempt` need an `Unpin + Sync`
+    // stream; `Pin<Box<_>>` is unconditionally `Unpin` regardless of the
+    // pointee, and `Sync` is requested explicitly on the trait object below
+    // (matching `upload_path_attempt`'s bound).
+    Box::pin(stream::unfold(
+        (reader, manifest.into_iter()),
+        |(mut reader, mut entries)| async move {
+            loop {
+                let entry = entries.next()?;
+
+                let buf = BytesMut::with_capacity(entry.size);
+                let bytes = match read_chunk_async(&mut reader, buf).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => return Some((Err(AtticError::from(e)), (reader, entries))),
+                };
+
+                if bytes.len() != entry.size {
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "Re-streamed NAR ended early: expected {} more bytes for a chunk \
+                             manifest entry but only got {}",
+                            entry.size,
+                            bytes.len()
+                        ),
+                    );
+                    return Some((Err(AtticError::from(err)), (reader, entries)));
+                }
+
+                if entry.inline {
+                    return Some((Ok(bytes.to_vec()), (reader, entries)));
+                }
+
+                // A reference: bytes have already been consumed from the
+                // stream to keep it in sync; discard them and move on to
+                // the next manifest entry.
+            }
+        },
+    ))
+}
+
+/// Adapts a `Stream<Item = AtticResult<Vec<u8>>>` (as produced by
+/// `NixStore::nar_from_path`) into a `tokio::io::AsyncRead`, so it can be
+/// fed into `attic::chunking::chunk_stream` (the hash pass) and
+/// `attic::io::read_chunk_async` (the send pass).
+struct StreamAsyncReader<S> {
+    stream: S,
+    leftover: Bytes,
+}
+
+impl<S> StreamAsyncReader<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            leftover: Bytes::new(),
+        }
+    }
+}
+
+impl<S> AsyncRead for StreamAsyncReader<S>
+where
+    S: Stream<Item = AtticResult<Vec<u8>>> + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        loop {
+            if !this.leftover.is_empty() {
+                let n = this.leftover.len().min(buf.remaining());
+                buf.put_slice(&this.leftover[..n]);
+                this.leftover.advance(n);
+                return Poll::Ready(Ok(()));
+            }
+
+            match Pin::new(&mut this.stream).poll_next(cx) {
+                Poll::Ready(Some(Ok(data))) => {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    this.leftover = Bytes::from(data);
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(std::io::Error::other(e)));
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }

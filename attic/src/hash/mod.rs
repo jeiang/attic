@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::error::AtticResult;
 
 /// A hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Hash {
     /// An SHA-256 hash.
     Sha256([u8; 32]),
