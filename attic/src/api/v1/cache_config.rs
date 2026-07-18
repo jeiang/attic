@@ -103,6 +103,40 @@ pub struct CacheConfig {
     /// The retention period of the cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention_period: Option<RetentionPeriodConfig>,
+
+    /// The chunking parameters advertised by the server.
+    ///
+    /// This is read-only and may not be available.
+    ///
+    /// Its presence also signals that the server supports chunk-level
+    /// dedup negotiation (the `get-missing-chunks` endpoint, and chunk
+    /// manifests on path uploads). It is absent when chunking is disabled
+    /// on the server, or when the server requires proof of possession of
+    /// uploaded data (proof of possession requires the client to actually
+    /// send the NAR bytes, which is incompatible with letting clients skip
+    /// chunks the server already has).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub chunking: Option<ChunkingParameters>,
+}
+
+/// Chunking parameters used by the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkingParameters {
+    /// The minimum NAR size to trigger chunking.
+    #[serde(rename = "nar-size-threshold")]
+    pub nar_size_threshold: usize,
+
+    /// The preferred minimum size of a chunk, in bytes.
+    #[serde(rename = "min-size")]
+    pub min_size: usize,
+
+    /// The preferred average size of a chunk, in bytes.
+    #[serde(rename = "avg-size")]
+    pub avg_size: usize,
+
+    /// The preferred maximum size of a chunk, in bytes.
+    #[serde(rename = "max-size")]
+    pub max_size: usize,
 }
 
 /// Configuaration of a keypair.
@@ -139,6 +173,61 @@ impl CacheConfig {
             priority: None,
             upstream_cache_key_names: None,
             retention_period: None,
+            chunking: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunking_parameters_round_trips_through_json() {
+        let params = ChunkingParameters {
+            nar_size_threshold: 128 * 1024,
+            min_size: 16 * 1024,
+            avg_size: 64 * 1024,
+            max_size: 256 * 1024,
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: ChunkingParameters = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.nar_size_threshold, params.nar_size_threshold);
+        assert_eq!(deserialized.min_size, params.min_size);
+        assert_eq!(deserialized.avg_size, params.avg_size);
+        assert_eq!(deserialized.max_size, params.max_size);
+    }
+
+    /// Old clients/servers that don't know about `chunking` must still be
+    /// able to deserialize a `CacheConfig` that lacks the field, and it
+    /// must default to `None` rather than failing to deserialize.
+    #[test]
+    fn cache_config_without_chunking_field_defaults_to_none() {
+        let json = r#"{}"#;
+        // Note: all other fields are also `Option` with `skip_serializing_if`
+        // but only `chunking` carries an explicit `#[serde(default)]` (added
+        // alongside this field); this asserts that an entirely absent
+        // `chunking` key still deserializes successfully.
+        let deserialized: CacheConfig = serde_json::from_str(json).unwrap();
+        assert!(deserialized.chunking.is_none());
+    }
+
+    #[test]
+    fn cache_config_with_chunking_round_trips_through_json() {
+        let mut config = CacheConfig::blank();
+        config.chunking = Some(ChunkingParameters {
+            nar_size_threshold: 128 * 1024,
+            min_size: 16 * 1024,
+            avg_size: 64 * 1024,
+            max_size: 256 * 1024,
+        });
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: CacheConfig = serde_json::from_str(&json).unwrap();
+
+        let chunking = deserialized.chunking.expect("chunking present");
+        assert_eq!(chunking.nar_size_threshold, 128 * 1024);
     }
 }

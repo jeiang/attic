@@ -196,6 +196,14 @@ in {
           settings = {
             listen = "[::]:8080";
 
+            # Split feature coverage across the matrix: the sqlite combos
+            # disable proof-of-possession, which lets clients use
+            # chunk-level dedup negotiation (the server only advertises
+            # chunking parameters without proof-of-possession); the
+            # postgres combos keep the default (true) and exercise the
+            # proof-of-possession verification paths with full uploads.
+            require-proof-of-possession = config.database != "sqlite";
+
             jwt = { };
 
             chunking = {

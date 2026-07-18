@@ -21,11 +21,13 @@ use tokio::time;
 use crate::config::ServerConfig;
 use crate::version::ATTIC_DISTRIBUTOR;
 use attic::api::v1::cache_config::{CacheConfig, CreateCacheRequest, ListCachesResponse};
+use attic::api::v1::get_missing_chunks::{GetMissingChunksRequest, GetMissingChunksResponse};
 use attic::api::v1::get_missing_paths::{GetMissingPathsRequest, GetMissingPathsResponse};
 use attic::api::v1::upload_path::{
     ATTIC_NAR_INFO, ATTIC_NAR_INFO_PREAMBLE_SIZE, UploadPathNarInfo, UploadPathResult,
 };
 use attic::cache::CacheName;
+use attic::hash::Hash;
 use attic::nix_store::StorePathHash;
 
 /// The User-Agent string of Attic.
@@ -285,16 +287,46 @@ impl ApiClient {
         }
     }
 
+    /// Returns chunks missing from a cache.
+    pub async fn get_missing_chunks(
+        &self,
+        cache: &CacheName,
+        chunk_hashes: Vec<Hash>,
+    ) -> Result<GetMissingChunksResponse> {
+        let endpoint = self.endpoint.join("_api/v1/get-missing-chunks")?;
+        let payload = GetMissingChunksRequest {
+            cache: cache.to_owned(),
+            chunk_hashes,
+        };
+
+        let res = self.client.post(endpoint).json(&payload).send().await?;
+
+        if res.status().is_success() {
+            let response = res.json().await?;
+            Ok(response)
+        } else {
+            let api_error = ApiError::try_from_response(res).await?;
+            Err(api_error.into())
+        }
+    }
+
     /// Uploads a path.
+    ///
+    /// `body_size` is the number of bytes the request body will actually
+    /// contain. This is `nar_info.nar_size` for a normal (non-negotiated)
+    /// upload, but for a negotiated (chunk-manifest) upload the body only
+    /// contains the manifest's `inline` entries, which is smaller than the
+    /// full NAR.
     pub(crate) fn prepare_upload_path(
         &self,
         nar_info: UploadPathNarInfo,
         force_preamble: bool,
+        body_size: usize,
     ) -> Result<UploadPathRequest> {
         let endpoint = self.endpoint.join("_api/v1/upload-path")?;
         let upload_info_json = serde_json::to_string(&nar_info)?;
         let metadata = upload_path_metadata(upload_info_json, force_preamble)?;
-        let content_length = upload_content_length(&metadata, nar_info.nar_size)?;
+        let content_length = upload_content_length(&metadata, body_size)?;
 
         Ok(UploadPathRequest {
             endpoint,

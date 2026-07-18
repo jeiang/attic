@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use anyhow::anyhow;
 use async_compression::Level as CompressionLevel;
-use async_compression::tokio::bufread::{BrotliEncoder, XzEncoder, ZstdEncoder};
+use async_compression::tokio::bufread::{
+    BrotliDecoder, BrotliEncoder, XzDecoder, XzEncoder, ZstdDecoder, ZstdEncoder,
+};
 use axum::{
     body::Body,
     extract::{Extension, Json},
@@ -21,7 +23,7 @@ use sea_orm::ActiveValue::Set;
 use sea_orm::entity::prelude::*;
 use sea_orm::{QuerySelect, TransactionTrait};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufRead, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, BufReader};
 use tokio::sync::Semaphore;
 use tokio_util::io::StreamReader;
 use tracing::{Instrument, instrument};
@@ -31,11 +33,11 @@ use crate::compression::{CompressionStream, CompressorFn};
 use crate::config::CompressionType;
 use crate::error::{ErrorKind, ServerError, ServerResult};
 use crate::narinfo::Compression;
-use crate::storage::StorageBackend;
+use crate::storage::{Download, StorageBackend};
 use crate::{RequestState, State};
 use attic::api::v1::upload_path::{
-    ATTIC_NAR_INFO, ATTIC_NAR_INFO_PREAMBLE_SIZE, UploadPathNarInfo, UploadPathResult,
-    UploadPathResultKind,
+    ATTIC_NAR_INFO, ATTIC_NAR_INFO_PREAMBLE_SIZE, ChunkManifestEntry, UploadPathNarInfo,
+    UploadPathResult, UploadPathResultKind,
 };
 use attic::chunking::chunk_stream;
 use attic::hash::Hash;
@@ -250,7 +252,22 @@ async fn upload_path_inner(
         permit_started.elapsed().as_millis() as u64,
     );
 
+    if let Some(manifest) = upload_info.chunk_manifest.as_ref() {
+        validate_chunk_manifest(
+            manifest,
+            upload_info.nar_size,
+            state.config.chunking.nar_size_threshold,
+            state.config.require_proof_of_possession,
+        )?;
+    }
+
     // Try to acquire a lock on an existing NAR
+    //
+    // This whole-NAR dedup fast path is kept for negotiated uploads too:
+    // proof of possession is guaranteed to be disabled whenever a chunk
+    // manifest is accepted (see `validate_chunk_manifest`), so
+    // `upload_path_dedup` never needs to read the body, and it's fine that
+    // the body only contains the `inline` chunks rather than the whole NAR.
     if let Some(existing_nar) = database.find_and_lock_nar(&upload_info.nar_hash).await? {
         // Deduplicate?
         // TODO: Fully kill chunk recovery (no more missing chunks)
@@ -277,7 +294,53 @@ async fn upload_path_inner(
         }
     }
 
-    upload_path_new(username, cache, upload_info, stream, database, &state).await
+    if upload_info.chunk_manifest.is_some() {
+        upload_path_new_negotiated(username, cache, upload_info, stream, database, &state).await
+    } else {
+        upload_path_new(username, cache, upload_info, stream, database, &state).await
+    }
+}
+
+/// Validates a client-supplied chunk manifest before it's acted on.
+///
+/// This only checks the manifest's own internal consistency and whether
+/// negotiated uploads are even accepted server-side; it doesn't check
+/// individual chunk hashes against storage (that happens as each entry is
+/// resolved in `upload_path_new_negotiated`).
+fn validate_chunk_manifest(
+    manifest: &[ChunkManifestEntry],
+    nar_size: usize,
+    chunking_nar_size_threshold: usize,
+    require_proof_of_possession: bool,
+) -> ServerResult<()> {
+    // Proof of possession requires the server to hash the client-supplied
+    // bytes itself to confirm the client truly holds the data; a chunk
+    // manifest lets the client omit bytes it merely claims the server
+    // already has, which defeats that guarantee entirely. Chunking must
+    // also actually be enabled, since chunk manifests describe chunks.
+    if chunking_nar_size_threshold == 0 || require_proof_of_possession {
+        return Err(ErrorKind::RequestError(anyhow!(
+            "This server does not support negotiated (chunk-manifest) uploads"
+        ))
+        .into());
+    }
+
+    if manifest.is_empty() {
+        return Err(ErrorKind::RequestError(anyhow!("Chunk manifest must not be empty")).into());
+    }
+
+    let manifest_size = manifest
+        .iter()
+        .try_fold(0usize, |acc, entry| acc.checked_add(entry.size));
+
+    if manifest_size != Some(nar_size) {
+        return Err(ErrorKind::RequestError(anyhow!(
+            "Chunk manifest entry sizes do not sum to the declared NAR size"
+        ))
+        .into());
+    }
+
+    Ok(())
 }
 
 /// Uploads a path when there is already a matching NAR in the global cache.
@@ -505,11 +568,47 @@ async fn upload_path_new_chunked(
     while let Some(chunk) = uploads.next().await {
         uploaded_chunks.push(chunk?);
     }
-    let mut chunks = uploaded_chunks;
-    // Futures complete out of order; sort by the original chunk index for
-    // insert locality when writing chunkrefs below. Not required for
-    // correctness since each row carries its own `seq`.
+    let chunks = uploaded_chunks;
+
+    let result = finalize_chunked_upload(
+        nar_id,
+        &cache,
+        &upload_info,
+        username,
+        chunks,
+        *nar_size,
+        database,
+    )
+    .await?;
+
+    cleanup.cancel();
+
+    Ok(result)
+}
+
+/// Finalizes a chunked or negotiated upload once all of its chunks
+/// (uploaded, deduplicated, or resolved by reference) are accounted for.
+///
+/// Shared by `upload_path_new_chunked` and `upload_path_new_negotiated`:
+/// sorts chunks by their sequence index, marks the pending NAR row
+/// `Valid`, batch-inserts the `chunkref` rows mapping the NAR to its
+/// chunks, and inserts the `object` mapping granting the cache access to
+/// the NAR — all within a single transaction.
+async fn finalize_chunked_upload(
+    nar_id: i64,
+    cache: &cache::Model,
+    upload_info: &UploadPathNarInfo,
+    username: Option<String>,
+    mut chunks: Vec<(i32, UploadChunkResult)>,
+    nar_size: usize,
+    database: &DatabaseConnection,
+) -> ServerResult<Json<UploadPathResult>> {
+    // Futures/entries may be resolved out of order; sort by the original
+    // chunk index for insert locality when writing chunkrefs below. Not
+    // required for correctness since each row carries its own `seq`.
     chunks.sort_unstable_by_key(|(idx, _)| *idx);
+
+    let span = tracing::Span::current();
     span.record("chunk_count", chunks.len());
 
     let (file_size, deduplicated_size) =
@@ -580,14 +679,12 @@ async fn upload_path_new_chunked(
 
     txn.commit().await.map_err(ServerError::database_error)?;
 
-    cleanup.cancel();
-
     Ok(Json(UploadPathResult {
         kind: UploadPathResultKind::Uploaded,
         file_size: Some(file_size),
 
         // Currently, frac_deduplicated is computed from size before compression
-        frac_deduplicated: Some(deduplicated_size as f64 / *nar_size as f64),
+        frac_deduplicated: Some(deduplicated_size as f64 / nar_size as f64),
     }))
 }
 
@@ -688,6 +785,291 @@ async fn upload_path_new_unchunked(
         file_size: Some(file_size),
         frac_deduplicated: None,
     }))
+}
+
+/// Uploads a path using a client-negotiated chunk manifest.
+///
+/// The client has already decided the NAR's chunk boundaries (typically by
+/// running the same content-defined chunking algorithm locally) and, via a
+/// prior `get-missing-chunks` call, which of those chunks the server
+/// already has. The manifest (`upload_info.chunk_manifest`) tells us, for
+/// each chunk in NAR stream order, whether its raw uncompressed bytes are
+/// present in the request body (`inline`) or should already exist on the
+/// server (a reference, `inline: false`).
+///
+/// Integrity is the entire point of this path: the server must verify the
+/// full assembled NAR hash before registering anything, exactly as it
+/// would for a normal upload, so that no client can register a NAR mapping
+/// whose bytes the server hasn't verified byte-for-byte. We do this by
+/// maintaining a single running SHA-256 hasher fed, in order, by the
+/// inline entries' bytes (as they arrive in the request body) and by the
+/// referenced entries' bytes (decompressed on the fly from existing
+/// storage).
+///
+/// Concurrency note: entries are processed strictly sequentially — unlike
+/// `upload_path_new_chunked`'s `FuturesUnordered` fan-out — because the NAR
+/// hash must be accumulated in stream order, and a later manifest entry
+/// may reference a chunk hash that only becomes available once an earlier
+/// inline entry for that same hash finishes uploading. Negotiated uploads
+/// trade server-side parallelism for the client bandwidth saved by
+/// omitting chunks the server already has.
+async fn upload_path_new_negotiated(
+    username: Option<String>,
+    cache: cache::Model,
+    upload_info: UploadPathNarInfo,
+    stream: impl AsyncBufRead + Send + Unpin + 'static,
+    database: &DatabaseConnection,
+    state: &State,
+) -> ServerResult<Json<UploadPathResult>> {
+    let mut stream = stream;
+
+    let compression_config = &state.config.compression;
+    let compression_type = compression_config.r#type;
+    let compression_level = compression_config.level();
+    let compression: Compression = compression_type.into();
+
+    // Validated to be `Some` by `validate_chunk_manifest` before this
+    // function is ever called.
+    let manifest = upload_info
+        .chunk_manifest
+        .clone()
+        .expect("chunk_manifest was validated to be Some by the caller");
+
+    let nar_size_db = i64::try_from(upload_info.nar_size).map_err(ServerError::request_error)?;
+
+    // Create a pending NAR entry
+    let nar_id = {
+        let model = nar::ActiveModel {
+            state: Set(NarState::PendingUpload),
+            compression: Set(compression.to_string()),
+
+            nar_hash: Set(upload_info.nar_hash.to_typed_base16()),
+            nar_size: Set(nar_size_db),
+
+            num_chunks: Set(0),
+
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        };
+
+        let insertion = Nar::insert(model)
+            .exec(database)
+            .await
+            .map_err(ServerError::database_error)?;
+
+        insertion.last_insert_id
+    };
+
+    let cleanup = Finally::new({
+        let database = database.clone();
+        let nar_model = nar::ActiveModel {
+            id: Set(nar_id),
+            ..Default::default()
+        };
+
+        async move {
+            tracing::info!(cleanup_outcome = "started", cleanup = "nar", "Upload cleanup started");
+
+            if let Err(e) = Nar::delete(nar_model).exec(&database).await {
+                tracing::warn!(cleanup_outcome = "failed", cleanup = "nar", error = %e, "Upload cleanup failed");
+            } else {
+                tracing::info!(cleanup_outcome = "succeeded", cleanup = "nar", "Upload cleanup completed");
+            }
+        }
+        .instrument(tracing::Span::current())
+    });
+
+    let mut nar_hasher = Sha256::new();
+    let mut running_size: usize = 0;
+    let mut chunks: Vec<(i32, UploadChunkResult)> = Vec::with_capacity(manifest.len());
+
+    for (seq_idx, entry) in manifest.iter().enumerate() {
+        let seq_idx = i32::try_from(seq_idx).map_err(ServerError::request_error)?;
+
+        if entry.inline {
+            // Read exactly this entry's declared size out of the request
+            // body. A short read (client sent fewer bytes than declared)
+            // is a protocol violation.
+            let buf = BytesMut::with_capacity(entry.size);
+            let mut limited = (&mut stream).take(entry.size as u64);
+            let bytes = read_chunk_async(&mut limited, buf)
+                .await
+                .map_err(|e| ErrorKind::RequestError(e.into()))?;
+
+            if bytes.len() != entry.size {
+                return Err(ErrorKind::RequestError(anyhow!(
+                    "Chunk manifest entry declared {} bytes but only {} were in the request body",
+                    entry.size,
+                    bytes.len()
+                ))
+                .into());
+            }
+
+            nar_hasher.update(&bytes);
+            running_size += bytes.len();
+
+            // `upload_chunk` computes the trustworthy hash of these
+            // server-received bytes itself (see `ChunkData::Bytes`), dedups
+            // against an existing chunk if one already matches, and
+            // otherwise uploads it.
+            let chunk = upload_chunk(
+                ChunkData::Bytes(bytes),
+                compression_type,
+                compression_level,
+                database.clone(),
+                state.clone(),
+                state.config.require_proof_of_possession,
+            )
+            .await?;
+
+            // The client's claimed manifest hash must match what the
+            // server actually computed/found; otherwise the client lied
+            // about the manifest. The `Finally` cleanup guard unwinds the
+            // pending NAR row (already-uploaded inline chunks are left
+            // behind as orphans for GC, same as any other failure here).
+            if chunk.guard.chunk_hash != entry.hash.to_typed_base16() {
+                return Err(ErrorKind::RequestError(anyhow!(
+                    "Chunk manifest entry hash does not match the uploaded chunk's actual hash"
+                ))
+                .into());
+            }
+
+            chunks.push((seq_idx, chunk));
+        } else {
+            // A reference: the chunk must already exist on the server.
+            let guard = database
+                .find_and_lock_chunk(&entry.hash, compression)
+                .await?
+                .ok_or_else(|| {
+                    ErrorKind::RequestError(anyhow!("Referenced chunk is no longer available"))
+                })?;
+
+            let entry_size_db = i64::try_from(entry.size).map_err(ServerError::request_error)?;
+            if guard.chunk_size != entry_size_db {
+                return Err(ErrorKind::RequestError(anyhow!(
+                    "Referenced chunk's size does not match the chunk manifest entry"
+                ))
+                .into());
+            }
+
+            // Feed the chunk's (decompressed) content into the running NAR
+            // hasher. NAR downloads are otherwise streamed to clients
+            // compressed as-is (clients decompress `.nar.xz`/`.nar.zst`/etc.
+            // themselves), so this is the one place the server needs to
+            // actually decompress a chunk.
+            let backend = state.storage().await?;
+            let download = backend.download_file_db(&guard.remote_file.0, true).await?;
+            let raw_stream = match download {
+                Download::AsyncRead(r) => r,
+                Download::Url(_) => {
+                    return Err(ErrorKind::RequestError(anyhow!(
+                        "Referenced chunk's storage backend does not support streaming reads"
+                    ))
+                    .into());
+                }
+            };
+
+            let mut decoder = decompress_stream(&guard.compression, raw_stream)?;
+            let mut decompressed_size: usize = 0;
+            let mut buf = [0u8; 65536];
+            loop {
+                let n = decoder
+                    .read(&mut buf)
+                    .await
+                    .map_err(ServerError::request_error)?;
+
+                if n == 0 {
+                    break;
+                }
+
+                nar_hasher.update(&buf[..n]);
+                decompressed_size += n;
+            }
+
+            if decompressed_size != entry.size {
+                return Err(ErrorKind::RequestError(anyhow!(
+                    "Referenced chunk's decompressed size does not match the chunk manifest entry"
+                ))
+                .into());
+            }
+
+            running_size += decompressed_size;
+
+            chunks.push((
+                seq_idx,
+                UploadChunkResult {
+                    guard,
+                    deduplicated: true,
+                },
+            ));
+        }
+    }
+
+    // The request body must be fully consumed by the manifest's inline
+    // entries; any trailing data is a protocol violation.
+    let trailing = read_chunk_async(&mut stream, BytesMut::with_capacity(1))
+        .await
+        .map_err(|e| ErrorKind::RequestError(e.into()))?;
+    if !trailing.is_empty() {
+        return Err(ErrorKind::RequestError(anyhow!(
+            "Unexpected trailing data after chunk manifest"
+        ))
+        .into());
+    }
+
+    // Confirm that the assembled NAR's hash and size are correct. This is
+    // the crux of the mutual-distrust invariant: the server never trusts
+    // manifest hashes/sizes on their own, only what it verified itself.
+    let nar_hash_digest = nar_hasher.finalize();
+    let nar_hash = Hash::Sha256((&nar_hash_digest[..]).try_into().unwrap());
+
+    if nar_hash != upload_info.nar_hash || running_size != upload_info.nar_size {
+        return Err(ErrorKind::RequestError(anyhow!("Bad NAR Hash or Size")).into());
+    }
+
+    let span = tracing::Span::current();
+    span.record("received_bytes", running_size);
+    span.record("chunk_count", chunks.len());
+
+    let nar_size = upload_info.nar_size;
+    let result = finalize_chunked_upload(
+        nar_id,
+        &cache,
+        &upload_info,
+        username,
+        chunks,
+        nar_size,
+        database,
+    )
+    .await?;
+
+    cleanup.cancel();
+
+    Ok(result)
+}
+
+/// Wraps a raw chunk stream with the decoder matching its stored
+/// compression, so a referenced chunk's uncompressed bytes can be fed into
+/// the NAR hasher while resolving a negotiated upload's manifest entry.
+fn decompress_stream(
+    compression: &str,
+    stream: Box<dyn AsyncRead + Unpin + Send>,
+) -> ServerResult<Box<dyn AsyncRead + Unpin + Send>> {
+    let buffered = BufReader::new(stream);
+
+    Ok(match compression {
+        "none" => Box::new(buffered),
+        "br" => Box::new(BrotliDecoder::new(buffered)),
+        "zstd" => Box::new(ZstdDecoder::new(buffered)),
+        "xz" => Box::new(XzDecoder::new(buffered)),
+        other => {
+            return Err(ErrorKind::RequestError(anyhow!(
+                "Unsupported chunk compression: {}",
+                other
+            ))
+            .into());
+        }
+    })
 }
 
 /// Uploads a chunk with the desired compression.
@@ -997,7 +1379,10 @@ mod tests {
     use std::rc::Rc;
     use std::time::Instant;
 
-    use super::{UploadLifecycleGuard, UploadLifecycleOutcome};
+    use super::{
+        ChunkManifestEntry, Hash, UploadLifecycleGuard, UploadLifecycleOutcome,
+        validate_chunk_manifest,
+    };
 
     fn guard(
         events: Rc<RefCell<Vec<UploadLifecycleOutcome>>>,
@@ -1036,5 +1421,59 @@ mod tests {
         let events = Rc::new(RefCell::new(Vec::new()));
         drop(guard(events.clone()));
         assert_eq!(*events.borrow(), [UploadLifecycleOutcome::Cancelled]);
+    }
+
+    fn sample_entry(hash_seed: &[u8], size: usize, inline: bool) -> ChunkManifestEntry {
+        ChunkManifestEntry {
+            hash: Hash::sha256_from_bytes(hash_seed),
+            size,
+            inline,
+        }
+    }
+
+    #[test]
+    fn validate_chunk_manifest_rejects_when_chunking_disabled() {
+        let manifest = vec![sample_entry(b"a", 10, true)];
+        let err = validate_chunk_manifest(&manifest, 10, 0, false).unwrap_err();
+        assert!(err.to_string().contains("does not support negotiated"));
+    }
+
+    #[test]
+    fn validate_chunk_manifest_rejects_when_proof_of_possession_required() {
+        let manifest = vec![sample_entry(b"a", 10, true)];
+        let err = validate_chunk_manifest(&manifest, 10, 1024, true).unwrap_err();
+        assert!(err.to_string().contains("does not support negotiated"));
+    }
+
+    #[test]
+    fn validate_chunk_manifest_rejects_empty_manifest() {
+        let manifest: Vec<ChunkManifestEntry> = Vec::new();
+        let err = validate_chunk_manifest(&manifest, 0, 1024, false).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_chunk_manifest_rejects_size_mismatch() {
+        let manifest = vec![sample_entry(b"a", 10, true), sample_entry(b"b", 20, false)];
+        let err = validate_chunk_manifest(&manifest, 31, 1024, false).unwrap_err();
+        assert!(err.to_string().contains("do not sum"));
+    }
+
+    /// A maliciously huge manifest entry size must be rejected cleanly
+    /// (via `checked_add`), not panic on overflow / wrap around silently.
+    #[test]
+    fn validate_chunk_manifest_rejects_size_overflow_without_panicking() {
+        let manifest = vec![
+            sample_entry(b"a", usize::MAX, true),
+            sample_entry(b"b", usize::MAX, false),
+        ];
+        let err = validate_chunk_manifest(&manifest, 10, 1024, false).unwrap_err();
+        assert!(err.to_string().contains("do not sum"));
+    }
+
+    #[test]
+    fn validate_chunk_manifest_accepts_valid_manifest() {
+        let manifest = vec![sample_entry(b"a", 10, true), sample_entry(b"b", 20, false)];
+        validate_chunk_manifest(&manifest, 30, 1024, false).unwrap();
     }
 }

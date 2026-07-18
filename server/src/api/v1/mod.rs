@@ -1,4 +1,5 @@
 mod cache_config;
+mod get_missing_chunks;
 mod get_missing_paths;
 mod upload_path;
 
@@ -12,6 +13,10 @@ pub(crate) fn get_router() -> Router {
         .route(
             "/_api/v1/get-missing-paths",
             post(get_missing_paths::get_missing_paths),
+        )
+        .route(
+            "/_api/v1/get-missing-chunks",
+            post(get_missing_chunks::get_missing_chunks),
         )
         .route("/_api/v1/upload-path", put(upload_path::upload_path))
         .route("/_api/v1/cache-config", get(cache_config::list_caches))

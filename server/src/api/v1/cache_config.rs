@@ -13,7 +13,8 @@ use crate::database::entity::cache::{self, Entity as Cache};
 use crate::error::{ErrorKind, ServerError, ServerResult};
 use crate::{RequestState, State};
 use attic::api::v1::cache_config::{
-    CacheConfig, CreateCacheRequest, KeypairConfig, ListCachesResponse, RetentionPeriodConfig,
+    CacheConfig, ChunkingParameters, CreateCacheRequest, KeypairConfig, ListCachesResponse,
+    RetentionPeriodConfig,
 };
 use attic::cache::CacheName;
 use attic::signing::NixKeypair;
@@ -73,6 +74,25 @@ pub(crate) async fn get_cache_config(
         RetentionPeriodConfig::Global
     };
 
+    // Advertise chunking parameters (and thus chunk-level dedup
+    // negotiation support) only when chunking is actually enabled and
+    // proof of possession isn't required. Proof of possession makes the
+    // server hash the client-supplied bytes to confirm the client truly
+    // holds the data, which is fundamentally incompatible with letting the
+    // client omit chunks it merely claims the server already has.
+    let chunking = if state.config.chunking.nar_size_threshold > 0
+        && !state.config.require_proof_of_possession
+    {
+        Some(ChunkingParameters {
+            nar_size_threshold: state.config.chunking.nar_size_threshold,
+            min_size: state.config.chunking.min_size,
+            avg_size: state.config.chunking.avg_size,
+            max_size: state.config.chunking.max_size,
+        })
+    } else {
+        None
+    };
+
     Ok(Json(CacheConfig {
         substituter_endpoint: Some(req_state.substituter_endpoint(cache_name)?),
         api_endpoint: Some(req_state.api_endpoint()?),
@@ -83,6 +103,7 @@ pub(crate) async fn get_cache_config(
         priority: Some(cache.priority),
         upstream_cache_key_names: Some(cache.upstream_cache_key_names.0),
         retention_period: Some(retention_period_config),
+        chunking,
     }))
 }
 
