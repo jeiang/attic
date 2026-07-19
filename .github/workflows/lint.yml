@@ -8,11 +8,16 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Pinned Attic client; see build.yml for the pin-bump policy.
+  ATTIC_CLIENT_PIN: 828b7ba583afae9523cda1c66d466ea430ea0160
+  ATTIC_SUBSTITUTER: https://attic.jeiang.dev/default
+  ATTIC_PUBLIC_KEY: "default:Xaqeg5b1ctNwH4sEWG+nt1kSpGPpFG0zivJUbZyCfdM="
 
 jobs:
   lint:
@@ -34,10 +39,13 @@ jobs:
       - name: Install Attic
         run: |
           if ! command -v attic &> /dev/null; then
-            ./.github/install-attic-ci.sh
+            nix profile install \
+              --extra-substituters "$ATTIC_SUBSTITUTER" \
+              --extra-trusted-public-keys "$ATTIC_PUBLIC_KEY" \
+              "github:jeiang/attic/${ATTIC_CLIENT_PIN}#attic-client"
           fi
 
-      - name: Configure Attic
+      - name: Configure Attic (pull-only)
         continue-on-error: true
         run: ./.ci/configure-attic.sh
         env:

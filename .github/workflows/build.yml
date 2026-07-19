@@ -15,6 +15,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Attic client pinned to a reviewed fork commit and substituted from the
+  # public cache when already built. Bump this pin (together with the
+  # server image in the deployment repo) on major client updates: a new
+  # upload protocol, additional server features the client must speak, or
+  # security fixes. Routine commits do not need a bump.
+  ATTIC_CLIENT_PIN: 828b7ba583afae9523cda1c66d466ea430ea0160
+  ATTIC_SUBSTITUTER: https://attic.jeiang.dev/default
+  ATTIC_PUBLIC_KEY: "default:Xaqeg5b1ctNwH4sEWG+nt1kSpGPpFG0zivJUbZyCfdM="
+
 jobs:
   build:
     strategy:
@@ -38,10 +48,13 @@ jobs:
       - name: Install Attic
         run: |
           if ! command -v attic &> /dev/null; then
-            ./.github/install-attic-ci.sh
+            nix profile install \
+              --extra-substituters "$ATTIC_SUBSTITUTER" \
+              --extra-trusted-public-keys "$ATTIC_PUBLIC_KEY" \
+              "github:jeiang/attic/${ATTIC_CLIENT_PIN}#attic-client"
           fi
 
-      - name: Configure Attic
+      - name: Configure Attic (pull-only)
         continue-on-error: true
         run: ./.ci/configure-attic.sh
         env:
@@ -62,7 +75,8 @@ jobs:
             .#attic \
             .#attic-client \
             .#attic-server \
-          | if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+          | if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            ./.ci/attic-login-push.sh </dev/null
             xargs ./.ci/attic-push-retry.sh "ci:$ATTIC_CACHE"
           else
             cat
@@ -93,10 +107,13 @@ jobs:
       - name: Install Attic
         run: |
           if ! command -v attic &> /dev/null; then
-            ./.github/install-attic-ci.sh
+            nix profile install \
+              --extra-substituters "$ATTIC_SUBSTITUTER" \
+              --extra-trusted-public-keys "$ATTIC_PUBLIC_KEY" \
+              "github:jeiang/attic/${ATTIC_CLIENT_PIN}#attic-client"
           fi
 
-      - name: Configure Attic
+      - name: Configure Attic (pull-only)
         continue-on-error: true
         run: ./.ci/configure-attic.sh
         env:
@@ -122,7 +139,8 @@ jobs:
       - name: Push build artifacts
         run: |
           export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+          if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            ./.ci/attic-login-push.sh
             nix build --no-link --print-out-paths -L \
               .#internalMatrix."$system".\"${{ matrix.nix }}\".attic-tests \
               .#internalMatrix."$system".\"${{ matrix.nix }}\".cargoArtifacts \
@@ -141,10 +159,13 @@ jobs:
       - name: Install Attic
         run: |
           if ! command -v attic &> /dev/null; then
-            ./.github/install-attic-ci.sh
+            nix profile install \
+              --extra-substituters "$ATTIC_SUBSTITUTER" \
+              --extra-trusted-public-keys "$ATTIC_PUBLIC_KEY" \
+              "github:jeiang/attic/${ATTIC_CLIENT_PIN}#attic-client"
           fi
 
-      - name: Configure Attic
+      - name: Configure Attic (pull-only)
         continue-on-error: true
         run: ./.ci/configure-attic.sh
         env:
@@ -180,10 +201,13 @@ jobs:
       - name: Install Attic
         run: |
           if ! command -v attic &> /dev/null; then
-            ./.github/install-attic-ci.sh
+            nix profile install \
+              --extra-substituters "$ATTIC_SUBSTITUTER" \
+              --extra-trusted-public-keys "$ATTIC_PUBLIC_KEY" \
+              "github:jeiang/attic/${ATTIC_CLIENT_PIN}#attic-client"
           fi
 
-      - name: Configure Attic
+      - name: Configure Attic (pull-only)
         continue-on-error: true
         run: ./.ci/configure-attic.sh
         env:
@@ -193,7 +217,8 @@ jobs:
       - name: Build ${{ matrix.attr }}
         run: |
           nix build --no-link --print-out-paths -L '.#${{ matrix.attr }}' \
-          | if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+          | if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            ./.ci/attic-login-push.sh </dev/null
             xargs ./.ci/attic-push-retry.sh "ci:$ATTIC_CACHE"
           else
             cat
@@ -220,10 +245,13 @@ jobs:
       - name: Install Attic
         run: |
           if ! command -v attic &> /dev/null; then
-            ./.github/install-attic-ci.sh
+            nix profile install \
+              --extra-substituters "$ATTIC_SUBSTITUTER" \
+              --extra-trusted-public-keys "$ATTIC_PUBLIC_KEY" \
+              "github:jeiang/attic/${ATTIC_CLIENT_PIN}#attic-client"
           fi
 
-      - name: Configure Attic
+      - name: Configure Attic (pull-only)
         continue-on-error: true
         run: ./.ci/configure-attic.sh
         env:
@@ -283,7 +311,8 @@ jobs:
         shell: bash
         run: |
           export PATH=$HOME/.nix-profile/bin:$PATH # FIXME
-          if [ -n "$ATTIC_CACHE" ]; then
+          if [ -n "$ATTIC_CACHE" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            ./.ci/attic-login-push.sh
             ./.ci/attic-push-retry.sh "ci:$ATTIC_CACHE" \
               "${{ steps.images.outputs.amd64 }}" \
               "${{ steps.images.outputs.arm64 }}"
