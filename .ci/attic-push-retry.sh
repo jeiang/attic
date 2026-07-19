@@ -3,6 +3,10 @@
 # The server deduplicates already-uploaded paths, so retries only
 # re-upload whatever failed mid-transfer.
 #
+# A cache push is an optimization, not a build product: exhausting all
+# attempts emits a workflow warning and exits 0 so cache outages cannot
+# fail CI. Set ATTIC_PUSH_STRICT=1 to restore hard failure.
+#
 # Each attempt runs under a watchdog: the bootstrap attic client has no
 # request timeout, so a black-holed connection hangs `attic push`
 # forever instead of erroring. Tune with ATTIC_PUSH_TIMEOUT (seconds).
@@ -46,4 +50,8 @@ for attempt in $(seq 1 "$attempts"); do
 done
 
 echo "attic push failed after $attempts attempts" >&2
-exit 1
+if [ "${ATTIC_PUSH_STRICT:-0}" = "1" ]; then
+  exit 1
+fi
+echo "::warning::attic push failed after $attempts attempts; continuing without cache push"
+exit 0
